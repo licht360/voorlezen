@@ -177,6 +177,68 @@ def fetch_html(url: str) -> str | None:
         return None
 
 
+def extract_jsonld(html: str) -> str:
+    """Zoek naar Schema.org Article-data in JSON-LD scripts."""
+    pattern = r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+    matches = re.findall(pattern, html, flags=re.DOTALL | re.IGNORECASE)
+    candidates = []
+    for match in matches:
+        try:
+            data = json.loads(match.strip())
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        # Voeg @graph-items toe (veelgebruikt patroon)
+        for item in list(items):
+            if isinstance(item, dict) and "@graph" in item:
+                items.extend(item["@graph"])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            body = item.get("articleBody") or item.get("description")
+            if body and isinstance(body, str):
+                candidates.append(body.strip())
+    if candidates:
+        # Geef de langste terug
+        return max(candidates, key=len)
+    return ""
+
+
+def extract_with_claude(html: str) -> str:
+    """Laatste redmiddel: Claude extraheert hoofdtekst uit ruwe HTML."""
+    client = get_anthropic_client()
+    if not client:
+        return ""
+
+    # Strip scripts en stijl om tokens te besparen
+    cleaned = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<style[^>]*>.*?</style>",   "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<!--.*?-->",                "", cleaned, flags=re.DOTALL)
+    if len(cleaned) > 80_000:
+        cleaned = cleaned[:80_000]
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8096,
+            system=(
+                "Je krijgt ruwe HTML van een webpagina. Extraheer ALLEEN de "
+                "hoofdtekst van het artikel of nieuwsbericht. Negeer menu's, "
+                "advertenties, footers, comments, gerelateerde artikelen, "
+                "navigatielinks en auteur/datum-info. Geef alleen de leesbare "
+                "tekst terug, zonder HTML-tags en zonder toelichting. "
+                "Als er geen duidelijk artikel is, antwoord met 'GEEN_ARTIKEL'."
+            ),
+            messages=[{"role": "user", "content": cleaned}],
+        )
+        result = response.content[0].text.strip()
+        if result == "GEEN_ARTIKEL" or len(result) < 100:
+            return ""
+        return result
+    except Exception:
+        return ""
+
+
 def extract_text_url(url: str) -> str:
     if not is_valid_url(url):
         st.error("Ongeldige URL. Gebruik http:// of https://")
@@ -187,7 +249,7 @@ def extract_text_url(url: str) -> str:
         st.error("URL kon niet worden opgehaald.")
         return ""
 
-    # Probeer meerdere extractiestrategieën
+    # Strategie 1: trafilatura met verschillende settings
     for kwargs in (
         {},
         {"favor_recall": True},
@@ -199,6 +261,17 @@ def extract_text_url(url: str) -> str:
                 return text.strip()
         except Exception:
             continue
+
+    # Strategie 2: JSON-LD (Schema.org Article)
+    jsonld_text = extract_jsonld(html)
+    if jsonld_text and len(jsonld_text) > 100:
+        return jsonld_text
+
+    # Strategie 3: Claude als laatste redmiddel
+    st.info("⚙️ Standaard extractie lukte niet — Claude probeert het nu...")
+    claude_text = extract_with_claude(html)
+    if claude_text and len(claude_text) > 100:
+        return claude_text
 
     st.error(
         "Geen hoofdtekst gevonden. De pagina gebruikt mogelijk JavaScript "
