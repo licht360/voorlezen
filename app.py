@@ -105,6 +105,13 @@ def has_cached_audio(entry_id: str, voice: str) -> bool:
     return audio_cache_path(entry_id, voice).exists()
 
 
+def list_cached_voices(entry_id: str | None) -> list[str]:
+    """Geef alle stemmen terug waarvoor audio in cache staat."""
+    if not entry_id:
+        return []
+    return [v for v in VOICE_OPTIONS if has_cached_audio(entry_id, v)]
+
+
 # ── API-clients (gecached) ────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -435,6 +442,46 @@ def render_translate_section(editable_text: str):
                 st.rerun()
 
 
+def render_saved_audio_section():
+    """Toon alle opgeslagen MP3's voor het huidige artikel."""
+    entry_id = st.session_state.get("current_entry_id")
+    if not entry_id:
+        return
+
+    cached_voices = list_cached_voices(entry_id)
+    if not cached_voices:
+        return
+
+    title_safe = re.sub(
+        r"[^\w\-]", "_",
+        st.session_state.get("current_title", "audio") or "audio",
+    )[:50]
+
+    with st.expander(f"🎵 Opgeslagen audio ({len(cached_voices)} versie{'s' if len(cached_voices) > 1 else ''})", expanded=True):
+        for voice in cached_voices:
+            audio_bytes = load_cached_audio(entry_id, voice)
+            if not audio_bytes:
+                continue
+
+            cols = st.columns([1, 4, 1, 1])
+            with cols[0]:
+                st.markdown(f"**🔊 {voice}**")
+            with cols[1]:
+                st.audio(audio_bytes, format="audio/mp3")
+            with cols[2]:
+                size_kb = len(audio_bytes) / 1024
+                st.caption(f"{size_kb:.0f} KB")
+            with cols[3]:
+                st.download_button(
+                    "⬇️",
+                    data=audio_bytes,
+                    file_name=f"{title_safe}_{voice}.mp3",
+                    mime="audio/mpeg",
+                    key=f"dl_saved_{voice}",
+                    help="Download MP3",
+                )
+
+
 def render_tts_section(editable_text: str):
     st.subheader("3. Voorlezen")
 
@@ -513,6 +560,7 @@ def main():
     render_save_section(editable_text)
     render_translate_section(editable_text)
     st.divider()
+    render_saved_audio_section()
     render_tts_section(editable_text)
 
 
