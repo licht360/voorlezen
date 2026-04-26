@@ -1,9 +1,9 @@
 # requirements: streamlit, pdfplumber, trafilatura, openai, langdetect, anthropic
 
-import hashlib
 import json
 import os
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -17,17 +17,16 @@ from langdetect import LangDetectException, detect
 from openai import OpenAI
 
 # ── Configuratie ──────────────────────────────────────────────────────────────
-DATA_DIR   = Path(__file__).parent / "data"
-AUDIO_DIR  = DATA_DIR / "audio"
-TEXTS_FILE = DATA_DIR / "texts.json"
+DATA_DIR     = Path(__file__).parent / "data"
+AUDIO_DIR    = DATA_DIR / "audio"
+LIBRARY_FILE = DATA_DIR / "texts.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
 
 MAX_PDF_SIZE_MB      = 25
 TTS_MAX_CHARS        = 4096
-TTS_PARALLEL_WORKERS = 8           # Aantal gelijktijdige TTS-calls
-PRICE_PER_1M_CHARS   = 15.00       # OpenAI tts-1 prijs (USD)
+TTS_PARALLEL_WORKERS = 8
 
 VOICE_OPTIONS = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 
@@ -39,38 +38,37 @@ st.set_page_config(
 )
 
 
-# ── Bibliotheek ───────────────────────────────────────────────────────────────
+# ── Bibliotheek (alleen MP3 + metadata) ───────────────────────────────────────
 
 def load_library() -> list[dict]:
-    if TEXTS_FILE.exists():
+    if LIBRARY_FILE.exists():
         try:
-            return json.loads(TEXTS_FILE.read_text(encoding="utf-8"))
+            return json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
         except Exception:
             return []
     return []
 
 
 def save_library(library: list[dict]) -> None:
-    TEXTS_FILE.write_text(
+    LIBRARY_FILE.write_text(
         json.dumps(library, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
-def make_entry_id(text: str) -> str:
-    return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+def add_to_library(title: str, source_type: str, source: str,
+                   voice: str, chars: int, audio_bytes: bytes) -> str:
+    entry_id = uuid.uuid4().hex[:12]
+    (AUDIO_DIR / f"{entry_id}.mp3").write_bytes(audio_bytes)
 
-
-def add_to_library(title: str, source: str, text: str) -> str:
     library = load_library()
-    entry_id = make_entry_id(text)
-    library  = [e for e in library if e["id"] != entry_id]
     library.insert(0, {
-        "id":     entry_id,
-        "title":  title,
-        "source": source,
-        "date":   datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "chars":  len(text),
-        "text":   text,
+        "id":          entry_id,
+        "title":       title,
+        "source_type": source_type,
+        "source":      source,
+        "voice":       voice,
+        "chars":       chars,
+        "date":        datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
     save_library(library)
     return entry_id
@@ -79,40 +77,23 @@ def add_to_library(title: str, source: str, text: str) -> str:
 def delete_from_library(entry_id: str) -> None:
     library = [e for e in load_library() if e["id"] != entry_id]
     save_library(library)
-    for audio_file in AUDIO_DIR.glob(f"{entry_id}_*.mp3"):
-        audio_file.unlink(missing_ok=True)
+    (AUDIO_DIR / f"{entry_id}.mp3").unlink(missing_ok=True)
+    # Backward compatibility: oude bestandsnamen
+    for old in AUDIO_DIR.glob(f"{entry_id}_*.mp3"):
+        old.unlink(missing_ok=True)
 
 
-# ── Audiocache ────────────────────────────────────────────────────────────────
-
-def audio_cache_path(entry_id: str, voice: str) -> Path:
-    safe_voice = re.sub(r"[^a-z]", "", voice.lower())
-    return AUDIO_DIR / f"{entry_id}_{safe_voice}.mp3"
-
-
-def load_cached_audio(entry_id: str | None, voice: str) -> bytes | None:
-    if not entry_id:
-        return None
-    path = audio_cache_path(entry_id, voice)
-    return path.read_bytes() if path.exists() else None
+def load_audio(entry_id: str) -> bytes | None:
+    new_path = AUDIO_DIR / f"{entry_id}.mp3"
+    if new_path.exists():
+        return new_path.read_bytes()
+    # Backward compatibility
+    for old in AUDIO_DIR.glob(f"{entry_id}_*.mp3"):
+        return old.read_bytes()
+    return None
 
 
-def save_cached_audio(entry_id: str, voice: str, audio_bytes: bytes) -> None:
-    audio_cache_path(entry_id, voice).write_bytes(audio_bytes)
-
-
-def has_cached_audio(entry_id: str, voice: str) -> bool:
-    return audio_cache_path(entry_id, voice).exists()
-
-
-def list_cached_voices(entry_id: str | None) -> list[str]:
-    """Geef alle stemmen terug waarvoor audio in cache staat."""
-    if not entry_id:
-        return []
-    return [v for v in VOICE_OPTIONS if has_cached_audio(entry_id, v)]
-
-
-# ── API-clients (gecached) ────────────────────────────────────────────────────
+# ── API-clients ───────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_openai_client() -> OpenAI | None:
@@ -140,6 +121,7 @@ def extract_text_pdf(uploaded_file) -> str:
     if uploaded_file.size > MAX_PDF_SIZE_MB * 1024 * 1024:
         st.error(f"PDF te groot (max {MAX_PDF_SIZE_MB} MB).")
         return ""
+    uploaded_file.seek(0)
     text_blocks = []
     try:
         with pdfplumber.open(uploaded_file) as pdf:
@@ -183,7 +165,7 @@ def extract_text_url(url: str) -> str:
         return ""
 
 
-# ── Vertaling ─────────────────────────────────────────────────────────────────
+# ── Vertaling & samenvatting ──────────────────────────────────────────────────
 
 def translate_to_dutch(text: str) -> str:
     client = get_anthropic_client()
@@ -209,20 +191,25 @@ def translate_to_dutch(text: str) -> str:
 
 
 def generate_title(text: str) -> str:
-    first = text.strip().split("\n")[0][:80]
-    return first if first else "Onbenoemd artikel"
-
-
-# ── Taaldetectie (gecached) ───────────────────────────────────────────────────
-
-@st.cache_data(show_spinner=False, max_entries=50)
-def detect_language(text: str) -> str:
-    if not text.strip():
-        return ""
+    """Genereer korte beschrijvende titel via Claude (fallback: eerste regel)."""
+    client = get_anthropic_client()
+    snippet = text.strip()[:2000]
+    if not client:
+        return text.strip().split("\n")[0][:80] or "Onbenoemd artikel"
     try:
-        return detect(text)
-    except LangDetectException:
-        return ""
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=100,
+            system=(
+                "Je krijgt een artikel of document. Geef één korte, beschrijvende "
+                "titel terug (max 70 tekens) die de inhoud samenvat. Geef alleen "
+                "de titel zelf, zonder aanhalingstekens of toelichting."
+            ),
+            messages=[{"role": "user", "content": snippet}],
+        )
+        return response.content[0].text.strip()[:80]
+    except Exception:
+        return text.strip().split("\n")[0][:80] or "Onbenoemd artikel"
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -261,8 +248,9 @@ def _tts_chunk(client: OpenAI, voice: str, chunk: str) -> bytes:
     return client.audio.speech.create(model="tts-1", voice=voice, input=chunk).content
 
 
-def text_to_audio_parallel(client: OpenAI, text: str, voice: str) -> bytes:
-    """Genereer TTS-audio met parallelle API-calls voor maximale snelheid."""
+def text_to_audio(client: OpenAI, text: str, voice: str,
+                  progress_bar, base: float, span: float) -> bytes:
+    """Parallelle TTS. Update progress_bar tussen `base` en `base + span`."""
     chunks = split_text(text)
 
     if len(chunks) == 1:
@@ -273,41 +261,113 @@ def text_to_audio_parallel(client: OpenAI, text: str, voice: str) -> bytes:
             return b""
 
     results: list[bytes | None] = [None] * len(chunks)
-    progress  = st.progress(0.0, text=f"Audio genereren ({len(chunks)} chunks parallel)...")
     completed = 0
 
-    try:
-        with ThreadPoolExecutor(max_workers=TTS_PARALLEL_WORKERS) as executor:
-            futures = {
-                executor.submit(_tts_chunk, client, voice, chunk): i
-                for i, chunk in enumerate(chunks)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    st.error(f"TTS API-fout bij chunk {idx + 1}: {e}")
-                    return b""
-                completed += 1
-                progress.progress(
-                    completed / len(chunks),
-                    text=f"Chunk {completed}/{len(chunks)} klaar...",
-                )
-    finally:
-        progress.empty()
+    with ThreadPoolExecutor(max_workers=TTS_PARALLEL_WORKERS) as executor:
+        futures = {
+            executor.submit(_tts_chunk, client, voice, chunk): i
+            for i, chunk in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                st.error(f"TTS API-fout bij chunk {idx + 1}: {e}")
+                return b""
+            completed += 1
+            progress_bar.progress(
+                base + (completed / len(chunks)) * span,
+                text=f"🎤 Audio genereren... ({completed}/{len(chunks)} chunks)",
+            )
 
     if any(r is None for r in results):
         return b""
     return b"".join(results)
 
 
+# ── Hoofdpipeline ─────────────────────────────────────────────────────────────
+
+def process_to_audio(source_type: str, source: str, source_data,
+                     voice: str, auto_translate: bool) -> dict | None:
+    """Doorloop de hele pipeline: extractie → vertaling → titel → TTS."""
+    progress = st.progress(0.0, text="🚀 Verwerken starten...")
+
+    try:
+        # 1. Tekstextractie (0% → 20%)
+        progress.progress(0.05, text="📄 Tekst extraheren...")
+        if source_type == "pdf":
+            text = extract_text_pdf(source_data)
+        else:
+            text = extract_text_url(source)
+
+        if not text:
+            return None
+
+        progress.progress(0.20, text=f"📄 Tekst gelezen ({len(text):,} tekens)".replace(",", "."))
+
+        # 2. Vertaling (20% → 35%)
+        if auto_translate:
+            try:
+                lang = detect(text)
+            except LangDetectException:
+                lang = "nl"
+            if lang != "nl":
+                progress.progress(0.25, text=f"🌍 Vertalen vanuit {lang.upper()} naar Nederlands...")
+                translated = translate_to_dutch(text)
+                if translated:
+                    text = translated
+                progress.progress(0.35, text="🌍 Vertaling klaar.")
+
+        # 3. Titel (35% → 40%)
+        progress.progress(0.37, text="📝 Titel genereren...")
+        title = generate_title(text)
+        progress.progress(0.40, text=f"📝 Titel: {title[:60]}")
+
+        # 4. TTS (40% → 100%)
+        client = get_openai_client()
+        if not client:
+            st.error("OpenAI API-sleutel ontbreekt.")
+            return None
+
+        audio_bytes = text_to_audio(
+            client, text, voice, progress, base=0.40, span=0.60,
+        )
+        if not audio_bytes:
+            return None
+
+        progress.progress(1.0, text="✅ Klaar!")
+
+        return {
+            "title":       title,
+            "source":      source,
+            "source_type": source_type,
+            "voice":       voice,
+            "chars":       len(text),
+            "audio_bytes": audio_bytes,
+        }
+    finally:
+        progress.empty()
+
+
 # ── Sidebar bibliotheek ───────────────────────────────────────────────────────
+
+def source_icon(entry: dict) -> str:
+    """Bepaal pictogram op basis van source_type (met fallback voor oude entries)."""
+    st_type = entry.get("source_type")
+    if st_type == "pdf":
+        return "📄"
+    if st_type == "url":
+        return "🔗"
+    src = entry.get("source", "")
+    return "🔗" if src.startswith(("http://", "https://")) else "📄"
+
 
 def render_sidebar():
     library = load_library()
     st.sidebar.header("📚 Bibliotheek")
-    st.sidebar.caption(f"{len(library)} artikelen opgeslagen")
+    n = len(library)
+    st.sidebar.caption(f"{n} artikel{'en' if n != 1 else ''} opgeslagen")
 
     if not library:
         st.sidebar.info("Nog geen artikelen opgeslagen.")
@@ -315,253 +375,164 @@ def render_sidebar():
 
     for entry in library:
         with st.sidebar.container(border=True):
-            st.markdown(f"**{entry['title']}**")
-            cached_voices = sum(
-                1 for v in VOICE_OPTIONS if has_cached_audio(entry["id"], v)
+            icon = source_icon(entry)
+            st.markdown(f"{icon} **{entry['title']}**")
+
+            voice = entry.get("voice", "?")
+            chars = entry.get("chars", 0)
+            st.caption(
+                f"{entry['date']} · 🎤 {voice} · "
+                f"{chars:,} tekens".replace(",", ".")
             )
-            audio_badge = f"· 🔊 {cached_voices}" if cached_voices else ""
-            chars = entry.get("chars", len(entry["text"]))
-            st.caption(f"{entry['date']} · {chars:,} tekens {audio_badge}".replace(",", "."))
+
+            src = entry.get("source", "")
+            if src:
+                src_display = src if len(src) <= 50 else src[:47] + "..."
+                st.caption(f"📍 {src_display}")
+
+            audio_bytes = load_audio(entry["id"])
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/mp3")
 
             cols = st.columns([3, 1])
             with cols[0]:
-                if st.button("Laden", key=f"load_{entry['id']}", use_container_width=True):
-                    st.session_state["extracted_text"]   = entry["text"]
-                    st.session_state["current_source"]   = entry["source"]
-                    st.session_state["current_entry_id"] = entry["id"]
-                    st.session_state["current_title"]    = entry["title"]
-                    st.rerun()
+                if audio_bytes:
+                    title_safe = re.sub(r"[^\w\-]", "_", entry["title"])[:50]
+                    st.download_button(
+                        "⬇️ MP3",
+                        data=audio_bytes,
+                        file_name=f"{title_safe}.mp3",
+                        mime="audio/mpeg",
+                        key=f"dl_{entry['id']}",
+                        use_container_width=True,
+                    )
             with cols[1]:
-                if st.button("🗑", key=f"del_{entry['id']}", use_container_width=True,
-                             help="Verwijder dit artikel en bijbehorende audio"):
+                if st.button(
+                    "🗑", key=f"del_{entry['id']}",
+                    use_container_width=True, help="Verwijderen",
+                ):
                     delete_from_library(entry["id"])
-                    if st.session_state.get("current_entry_id") == entry["id"]:
-                        for k in ("extracted_text", "current_source",
-                                  "current_entry_id", "current_title"):
-                            st.session_state.pop(k, None)
                     st.rerun()
 
 
-# ── Hoofdsecties ──────────────────────────────────────────────────────────────
+# ── Hoofdscherm ───────────────────────────────────────────────────────────────
 
-def render_input_section():
-    st.subheader("1. Tekst inladen")
+def render_main():
+    st.title("🎧 Voorlezen")
+    st.caption("Upload een PDF of voer een URL in en laat het direct voorlezen.")
+
+    # Instellingen
+    cols = st.columns([2, 3])
+    with cols[0]:
+        voice = st.selectbox("Stem", VOICE_OPTIONS, index=4)
+    with cols[1]:
+        st.write("")
+        st.write("")
+        auto_translate = st.checkbox(
+            "Vertaal automatisch naar Nederlands",
+            value=True,
+            help="Niet-Nederlandse tekst wordt automatisch vertaald via Claude Sonnet.",
+        )
+
+    st.divider()
+
+    # Input
     tab_pdf, tab_url = st.tabs(["📄 PDF upload", "🔗 URL invoer"])
+
+    source_type = None
+    source      = None
+    source_data = None
 
     with tab_pdf:
         uploaded = st.file_uploader(
             "Kies een PDF", type=["pdf"], label_visibility="collapsed",
         )
-        if uploaded and st.button("Tekst extraheren", key="extract_pdf"):
-            with st.spinner("PDF verwerken..."):
-                text = extract_text_pdf(uploaded)
-            if text:
-                st.session_state["extracted_text"]   = text
-                st.session_state["current_source"]   = uploaded.name
-                st.session_state["current_entry_id"] = None
-                st.session_state["current_title"]    = uploaded.name.rsplit(".", 1)[0]
-                st.rerun()
+        if uploaded:
+            source_type = "pdf"
+            source      = uploaded.name
+            source_data = uploaded
+            st.info(f"📄 Klaar om te verwerken: **{uploaded.name}**")
 
     with tab_url:
         url = st.text_input(
-            "URL", placeholder="https://example.com/artikel", label_visibility="collapsed",
+            "URL", placeholder="https://example.com/artikel",
+            label_visibility="collapsed",
         )
-        if st.button("Tekst extraheren", key="extract_url"):
-            if not url.strip():
-                st.error("Voer een URL in.")
-            else:
-                with st.spinner("URL ophalen..."):
-                    text = extract_text_url(url.strip())
-                if text:
-                    st.session_state["extracted_text"]   = text
-                    st.session_state["current_source"]   = url.strip()
-                    st.session_state["current_entry_id"] = None
-                    st.session_state["current_title"]    = generate_title(text)
-                    st.rerun()
+        if url.strip() and not source_type:
+            source_type = "url"
+            source      = url.strip()
+            source_data = None
+            preview = source if len(source) <= 60 else source[:57] + "..."
+            st.info(f"🔗 Klaar om te verwerken: **{preview}**")
 
+    ready = source_type is not None
 
-def render_text_section() -> str:
-    st.subheader("2. Tekst bewerken")
+    if st.button(
+        "▶️  Voorlezen",
+        type="primary",
+        use_container_width=True,
+        disabled=not ready,
+    ) and ready:
+        st.session_state.pop("pending_result", None)
+        result = process_to_audio(source_type, source, source_data, voice, auto_translate)
+        if result:
+            st.session_state["pending_result"] = result
 
-    current_text  = st.session_state.get("extracted_text", "")
-    editable_text = st.text_area(
-        "Tekst", value=current_text, height=280,
-        placeholder="Tekst verschijnt hier na extractie of bij het laden uit de bibliotheek.",
-        label_visibility="collapsed",
+    # Resultaat
+    pending = st.session_state.get("pending_result")
+    if not pending:
+        return
+
+    st.divider()
+    icon = "📄" if pending["source_type"] == "pdf" else "🔗"
+    st.subheader(f"{icon} {pending['title']}")
+    st.caption(
+        f"🎤 {pending['voice']} · "
+        f"{pending['chars']:,} tekens".replace(",", ".")
     )
 
-    if editable_text.strip():
-        chars = len(editable_text)
-        words = len(editable_text.split())
-        lang  = detect_language(editable_text).upper() or "?"
-        cost  = (chars / 1_000_000) * PRICE_PER_1M_CHARS
+    st.audio(pending["audio_bytes"], format="audio/mp3")
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Tekens",    f"{chars:,}".replace(",", "."))
-        c2.metric("Woorden",   f"{words:,}".replace(",", "."))
-        c3.metric("Taal",      lang)
-        c4.metric("TTS-kosten", f"${cost:.3f}")
+    st.divider()
 
-    return editable_text
-
-
-def render_save_section(editable_text: str):
-    if not editable_text.strip():
-        return
-    with st.expander("💾 Opslaan in bibliotheek"):
-        default = st.session_state.get("current_title") or generate_title(editable_text)
-        title   = st.text_input("Titel", value=default[:80])
-        if st.button("Opslaan", type="primary"):
-            if not title.strip():
+    cols = st.columns([3, 2])
+    with cols[0]:
+        title_input = st.text_input(
+            "Titel voor in de bibliotheek",
+            value=pending["title"],
+        )
+        if st.button("💾 Opslaan in bibliotheek", type="primary", use_container_width=True):
+            if not title_input.strip():
                 st.error("Geef een titel op.")
-                return
-            entry_id = add_to_library(
-                title=title.strip(),
-                source=st.session_state.get("current_source", ""),
-                text=editable_text.strip(),
-            )
-            st.session_state["current_entry_id"] = entry_id
-            st.session_state["current_title"]    = title.strip()
-            st.success(f"Opgeslagen als '{title.strip()}'.")
-            st.rerun()
-
-
-def render_translate_section(editable_text: str):
-    text = editable_text.strip()
-    if not text:
-        return
-    lang = detect_language(text)
-    if lang and lang != "nl":
-        if st.button(f"🌍 Vertaal naar Nederlands ({lang.upper()} gedetecteerd)"):
-            with st.spinner("Tekst vertalen met Claude Sonnet..."):
-                translated = translate_to_dutch(text)
-            if translated:
-                st.session_state["extracted_text"]   = translated
-                st.session_state["current_entry_id"] = None
-                st.success("Vertaald naar Nederlands.")
+            else:
+                add_to_library(
+                    title       = title_input.strip(),
+                    source_type = pending["source_type"],
+                    source      = pending["source"],
+                    voice       = pending["voice"],
+                    chars       = pending["chars"],
+                    audio_bytes = pending["audio_bytes"],
+                )
+                st.session_state.pop("pending_result", None)
+                st.success(f"Opgeslagen: '{title_input.strip()}'")
                 st.rerun()
 
-
-def render_saved_audio_section():
-    """Toon alle opgeslagen MP3's voor het huidige artikel."""
-    entry_id = st.session_state.get("current_entry_id")
-    if not entry_id:
-        return
-
-    cached_voices = list_cached_voices(entry_id)
-    if not cached_voices:
-        return
-
-    title_safe = re.sub(
-        r"[^\w\-]", "_",
-        st.session_state.get("current_title", "audio") or "audio",
-    )[:50]
-
-    with st.expander(f"🎵 Opgeslagen audio ({len(cached_voices)} versie{'s' if len(cached_voices) > 1 else ''})", expanded=True):
-        for voice in cached_voices:
-            audio_bytes = load_cached_audio(entry_id, voice)
-            if not audio_bytes:
-                continue
-
-            cols = st.columns([1, 4, 1, 1])
-            with cols[0]:
-                st.markdown(f"**🔊 {voice}**")
-            with cols[1]:
-                st.audio(audio_bytes, format="audio/mp3")
-            with cols[2]:
-                size_kb = len(audio_bytes) / 1024
-                st.caption(f"{size_kb:.0f} KB")
-            with cols[3]:
-                st.download_button(
-                    "⬇️",
-                    data=audio_bytes,
-                    file_name=f"{title_safe}_{voice}.mp3",
-                    mime="audio/mpeg",
-                    key=f"dl_saved_{voice}",
-                    help="Download MP3",
-                )
-
-
-def render_tts_section(editable_text: str):
-    st.subheader("3. Voorlezen")
-
-    entry_id = st.session_state.get("current_entry_id")
-
-    cols = st.columns([2, 1])
-    with cols[0]:
-        if entry_id:
-            labels = [
-                ("🔊 " if has_cached_audio(entry_id, v) else "  ") + v
-                for v in VOICE_OPTIONS
-            ]
-            idx   = st.selectbox(
-                "Stem", range(len(VOICE_OPTIONS)),
-                format_func=lambda i: labels[i], index=4,
-            )
-            voice = VOICE_OPTIONS[idx]
-            st.caption("🔊 = audio aanwezig in cache (geen API-kosten)")
-        else:
-            voice = st.selectbox("Stem", VOICE_OPTIONS, index=4)
-
     with cols[1]:
+        title_safe = re.sub(r"[^\w\-]", "_", pending["title"])[:50]
         st.write("")
         st.write("")
-        play = st.button("▶️  Voorlezen", type="primary", use_container_width=True)
-
-    if not play:
-        return
-
-    text_to_read = editable_text.strip()
-    if not text_to_read:
-        st.error("Er is geen tekst om voor te lezen.")
-        return
-
-    cached = load_cached_audio(entry_id, voice)
-    if cached:
-        st.success("⚡ Direct uit cache geladen — geen API-kosten.")
-        audio_bytes = cached
-    else:
-        client = get_openai_client()
-        if not client:
-            st.error("OpenAI API-sleutel ontbreekt.")
-            return
-        audio_bytes = text_to_audio_parallel(client, text_to_read, voice)
-        if audio_bytes and entry_id:
-            save_cached_audio(entry_id, voice, audio_bytes)
-            st.success("✅ Audio gegenereerd en opgeslagen in cache.")
-        elif audio_bytes:
-            st.info("Tip: sla de tekst op in de bibliotheek om de audio te bewaren.")
-
-    if audio_bytes:
-        st.audio(audio_bytes, format="audio/mp3")
-        title_safe = re.sub(
-            r"[^\w\-]", "_",
-            st.session_state.get("current_title", "audio") or "audio",
-        )[:50]
         st.download_button(
-            "⬇️  Download MP3",
-            data=audio_bytes,
-            file_name=f"{title_safe}_{voice}.mp3",
+            "⬇️ Download MP3",
+            data=pending["audio_bytes"],
+            file_name=f"{title_safe}_{pending['voice']}.mp3",
             mime="audio/mpeg",
+            use_container_width=True,
         )
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     render_sidebar()
-
-    st.title("🎧 Voorlezen")
-    st.caption("Upload een PDF of voer een URL in en laat de tekst voorlezen.")
-
-    render_input_section()
-    st.divider()
-    editable_text = render_text_section()
-    render_save_section(editable_text)
-    render_translate_section(editable_text)
-    st.divider()
-    render_saved_audio_section()
-    render_tts_section(editable_text)
+    render_main()
 
 
 if __name__ == "__main__":
