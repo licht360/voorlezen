@@ -392,7 +392,7 @@ def render_sidebar():
 
             audio_bytes = load_audio(entry["id"])
             if audio_bytes:
-                st.audio(audio_bytes, format="audio/mp3")
+                st.audio(audio_bytes, format="audio/mpeg")
 
             cols = st.columns([3, 1])
             with cols[0]:
@@ -491,7 +491,7 @@ def render_main():
         f"{pending['chars']:,} tekens".replace(",", ".")
     )
 
-    st.audio(pending["audio_bytes"], format="audio/mp3")
+    st.audio(pending["audio_bytes"], format="audio/mpeg")
 
     st.divider()
 
