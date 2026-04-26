@@ -1,11 +1,13 @@
 # requirements: streamlit, pdfplumber, trafilatura, openai, langdetect, anthropic
 
 import hashlib
-import io
 import json
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import anthropic
 import pdfplumber
@@ -14,16 +16,30 @@ import trafilatura
 from langdetect import LangDetectException, detect
 from openai import OpenAI
 
-# ── Opslagmappen ──────────────────────────────────────────────────────────────
-DATA_DIR  = Path(__file__).parent / "data"
-AUDIO_DIR = DATA_DIR / "audio"
+# ── Configuratie ──────────────────────────────────────────────────────────────
+DATA_DIR   = Path(__file__).parent / "data"
+AUDIO_DIR  = DATA_DIR / "audio"
 TEXTS_FILE = DATA_DIR / "texts.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
 
+MAX_PDF_SIZE_MB      = 25
+TTS_MAX_CHARS        = 4096
+TTS_PARALLEL_WORKERS = 8           # Aantal gelijktijdige TTS-calls
+PRICE_PER_1M_CHARS   = 15.00       # OpenAI tts-1 prijs (USD)
 
-# ── Bibliotheekfuncties (teksten) ─────────────────────────────────────────────
+VOICE_OPTIONS = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+
+st.set_page_config(
+    page_title="Voorlezen",
+    page_icon="🎧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ── Bibliotheek ───────────────────────────────────────────────────────────────
 
 def load_library() -> list[dict]:
     if TEXTS_FILE.exists():
@@ -40,16 +56,20 @@ def save_library(library: list[dict]) -> None:
     )
 
 
+def make_entry_id(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+
+
 def add_to_library(title: str, source: str, text: str) -> str:
     library = load_library()
-    entry_id = hashlib.md5(text.encode()).hexdigest()[:10]
-    # Verwijder bestaand item met zelfde id
-    library = [e for e in library if e["id"] != entry_id]
+    entry_id = make_entry_id(text)
+    library  = [e for e in library if e["id"] != entry_id]
     library.insert(0, {
         "id":     entry_id,
         "title":  title,
         "source": source,
         "date":   datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "chars":  len(text),
         "text":   text,
     })
     save_library(library)
@@ -59,7 +79,6 @@ def add_to_library(title: str, source: str, text: str) -> str:
 def delete_from_library(entry_id: str) -> None:
     library = [e for e in load_library() if e["id"] != entry_id]
     save_library(library)
-    # Verwijder eventuele audio
     for audio_file in AUDIO_DIR.glob(f"{entry_id}_*.mp3"):
         audio_file.unlink(missing_ok=True)
 
@@ -67,61 +86,60 @@ def delete_from_library(entry_id: str) -> None:
 # ── Audiocache ────────────────────────────────────────────────────────────────
 
 def audio_cache_path(entry_id: str, voice: str) -> Path:
-    return AUDIO_DIR / f"{entry_id}_{voice}.mp3"
+    safe_voice = re.sub(r"[^a-z]", "", voice.lower())
+    return AUDIO_DIR / f"{entry_id}_{safe_voice}.mp3"
 
 
-def load_cached_audio(entry_id: str, voice: str) -> bytes | None:
+def load_cached_audio(entry_id: str | None, voice: str) -> bytes | None:
+    if not entry_id:
+        return None
     path = audio_cache_path(entry_id, voice)
-    if path.exists():
-        return path.read_bytes()
-    return None
+    return path.read_bytes() if path.exists() else None
 
 
 def save_cached_audio(entry_id: str, voice: str, audio_bytes: bytes) -> None:
     audio_cache_path(entry_id, voice).write_bytes(audio_bytes)
 
 
-# ── API-clients ───────────────────────────────────────────────────────────────
+def has_cached_audio(entry_id: str, voice: str) -> bool:
+    return audio_cache_path(entry_id, voice).exists()
 
-def get_openai_client() -> OpenAI:
+
+# ── API-clients (gecached) ────────────────────────────────────────────────────
+
+@st.cache_resource
+def get_openai_client() -> OpenAI | None:
     api_key = None
     try:
         api_key = st.secrets["OPENAI_API_KEY"]
     except Exception:
-        pass
-    if not api_key:
         api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        st.error("OpenAI API-sleutel ontbreekt. Voeg OPENAI_API_KEY toe aan st.secrets of als omgevingsvariabele.")
-        st.stop()
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key) if api_key else None
 
 
-def get_anthropic_client() -> anthropic.Anthropic:
+@st.cache_resource
+def get_anthropic_client() -> anthropic.Anthropic | None:
     api_key = None
     try:
         api_key = st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
-        pass
-    if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        st.error("Anthropic API-sleutel ontbreekt. Voeg ANTHROPIC_API_KEY toe aan st.secrets of als omgevingsvariabele.")
-        st.stop()
-    return anthropic.Anthropic(api_key=api_key)
+    return anthropic.Anthropic(api_key=api_key) if api_key else None
 
 
 # ── Tekstextractie ────────────────────────────────────────────────────────────
 
 def extract_text_pdf(uploaded_file) -> str:
+    if uploaded_file.size > MAX_PDF_SIZE_MB * 1024 * 1024:
+        st.error(f"PDF te groot (max {MAX_PDF_SIZE_MB} MB).")
+        return ""
     text_blocks = []
     try:
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
-                page_height   = page.height
-                top_margin    = page_height * 0.10
-                bottom_margin = page_height * 0.90
-                cropped   = page.within_bbox((0, top_margin, page.width, bottom_margin))
+                top    = page.height * 0.10
+                bottom = page.height * 0.90
+                cropped   = page.within_bbox((0, top, page.width, bottom))
                 page_text = cropped.extract_text()
                 if page_text:
                     text_blocks.append(page_text.strip())
@@ -131,11 +149,22 @@ def extract_text_pdf(uploaded_file) -> str:
     return "\n\n".join(text_blocks)
 
 
+def is_valid_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
 def extract_text_url(url: str) -> str:
+    if not is_valid_url(url):
+        st.error("Ongeldige URL. Gebruik http:// of https://")
+        return ""
     try:
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
-            st.error("URL kon niet worden opgehaald. Controleer de URL en probeer opnieuw.")
+            st.error("URL kon niet worden opgehaald.")
             return ""
         text = trafilatura.extract(downloaded)
         if not text:
@@ -150,8 +179,11 @@ def extract_text_url(url: str) -> str:
 # ── Vertaling ─────────────────────────────────────────────────────────────────
 
 def translate_to_dutch(text: str) -> str:
+    client = get_anthropic_client()
+    if not client:
+        st.error("Anthropic API-sleutel ontbreekt.")
+        return ""
     try:
-        client = get_anthropic_client()
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=8096,
@@ -169,9 +201,26 @@ def translate_to_dutch(text: str) -> str:
         return ""
 
 
+def generate_title(text: str) -> str:
+    first = text.strip().split("\n")[0][:80]
+    return first if first else "Onbenoemd artikel"
+
+
+# ── Taaldetectie (gecached) ───────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def detect_language(text: str) -> str:
+    if not text.strip():
+        return ""
+    try:
+        return detect(text)
+    except LangDetectException:
+        return ""
+
+
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
-def split_text(text: str, max_chars: int = 4096) -> list[str]:
+def split_text(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
     if len(text) <= max_chars:
         return [text]
     sentences, current = [], ""
@@ -182,6 +231,7 @@ def split_text(text: str, max_chars: int = 4096) -> list[str]:
             current = ""
     if current:
         sentences.append(current)
+
     chunks, chunk = [], ""
     for sentence in sentences:
         if len(chunk) + len(sentence) <= max_chars:
@@ -200,194 +250,270 @@ def split_text(text: str, max_chars: int = 4096) -> list[str]:
     return [c for c in chunks if c]
 
 
-def text_to_audio(client: OpenAI, text: str, voice: str) -> bytes:
+def _tts_chunk(client: OpenAI, voice: str, chunk: str) -> bytes:
+    return client.audio.speech.create(model="tts-1", voice=voice, input=chunk).content
+
+
+def text_to_audio_parallel(client: OpenAI, text: str, voice: str) -> bytes:
+    """Genereer TTS-audio met parallelle API-calls voor maximale snelheid."""
     chunks = split_text(text)
+
     if len(chunks) == 1:
         try:
-            return client.audio.speech.create(model="tts-1", voice=voice, input=chunks[0]).content
+            return _tts_chunk(client, voice, chunks[0])
         except Exception as e:
             st.error(f"TTS API-fout: {e}")
             return b""
 
-    audio_parts = []
-    progress = st.progress(0, text="Audio genereren...")
-    for i, chunk in enumerate(chunks):
-        try:
-            audio_parts.append(
-                client.audio.speech.create(model="tts-1", voice=voice, input=chunk).content
+    results: list[bytes | None] = [None] * len(chunks)
+    progress  = st.progress(0.0, text=f"Audio genereren ({len(chunks)} chunks parallel)...")
+    completed = 0
+
+    try:
+        with ThreadPoolExecutor(max_workers=TTS_PARALLEL_WORKERS) as executor:
+            futures = {
+                executor.submit(_tts_chunk, client, voice, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    st.error(f"TTS API-fout bij chunk {idx + 1}: {e}")
+                    return b""
+                completed += 1
+                progress.progress(
+                    completed / len(chunks),
+                    text=f"Chunk {completed}/{len(chunks)} klaar...",
+                )
+    finally:
+        progress.empty()
+
+    if any(r is None for r in results):
+        return b""
+    return b"".join(results)
+
+
+# ── Sidebar bibliotheek ───────────────────────────────────────────────────────
+
+def render_sidebar():
+    library = load_library()
+    st.sidebar.header("📚 Bibliotheek")
+    st.sidebar.caption(f"{len(library)} artikelen opgeslagen")
+
+    if not library:
+        st.sidebar.info("Nog geen artikelen opgeslagen.")
+        return
+
+    for entry in library:
+        with st.sidebar.container(border=True):
+            st.markdown(f"**{entry['title']}**")
+            cached_voices = sum(
+                1 for v in VOICE_OPTIONS if has_cached_audio(entry["id"], v)
             )
-        except Exception as e:
-            st.error(f"TTS API-fout bij chunk {i + 1}: {e}")
-            return b""
-        progress.progress((i + 1) / len(chunks), text=f"Chunk {i + 1}/{len(chunks)} verwerkt...")
-    progress.empty()
-    return b"".join(audio_parts)
+            audio_badge = f"· 🔊 {cached_voices}" if cached_voices else ""
+            chars = entry.get("chars", len(entry["text"]))
+            st.caption(f"{entry['date']} · {chars:,} tekens {audio_badge}".replace(",", "."))
 
-
-# ── Hoofdapp ──────────────────────────────────────────────────────────────────
-
-def main():
-    st.title("Voorlezen")
-    st.caption("Upload een PDF of voer een URL in om tekst voor te laten lezen.")
-
-    # ── Tabbladen: nieuw / bibliotheek ────────────────────────────────────────
-    tab_nieuw, tab_bibliotheek = st.tabs(["Nieuw artikel", "Bibliotheek"])
-
-    # ── Tab: Nieuw artikel ────────────────────────────────────────────────────
-    with tab_nieuw:
-        sub_pdf, sub_url = st.tabs(["PDF upload", "URL invoer"])
-
-        with sub_pdf:
-            uploaded_file = st.file_uploader("Kies een PDF-bestand", type=["pdf"])
-            if uploaded_file is not None:
-                if st.button("Tekst extraheren uit PDF"):
-                    with st.spinner("PDF verwerken..."):
-                        tekst = extract_text_pdf(uploaded_file)
-                    if tekst:
-                        st.session_state["extracted_text"]  = tekst
-                        st.session_state["current_source"]  = uploaded_file.name
-                        st.session_state["current_entry_id"] = None
-                        st.success(f"Tekst geëxtraheerd ({len(tekst)} tekens).")
-                    else:
-                        st.error("Geen tekst gevonden in de PDF.")
-
-        with sub_url:
-            url_input = st.text_input("Voer een URL in", placeholder="https://example.com/artikel")
-            if st.button("Tekst extraheren uit URL"):
-                if not url_input.strip():
-                    st.error("Voer een geldige URL in.")
-                else:
-                    with st.spinner("URL ophalen en verwerken..."):
-                        tekst = extract_text_url(url_input.strip())
-                    if tekst:
-                        st.session_state["extracted_text"]   = tekst
-                        st.session_state["current_source"]   = url_input.strip()
-                        st.session_state["current_entry_id"] = None
-                        st.success(f"Tekst geëxtraheerd ({len(tekst)} tekens).")
-
-    # ── Tab: Bibliotheek ──────────────────────────────────────────────────────
-    with tab_bibliotheek:
-        library = load_library()
-        if not library:
-            st.info("De bibliotheek is nog leeg. Sla eerst een artikel op.")
-        else:
-            labels = [f"{e['date']}  —  {e['title']}" for e in library]
-            keuze  = st.selectbox("Kies een opgeslagen artikel", labels)
-            idx    = labels.index(keuze)
-            entry  = library[idx]
-
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.button("Laad artikel", use_container_width=True):
+            cols = st.columns([3, 1])
+            with cols[0]:
+                if st.button("Laden", key=f"load_{entry['id']}", use_container_width=True):
                     st.session_state["extracted_text"]   = entry["text"]
                     st.session_state["current_source"]   = entry["source"]
                     st.session_state["current_entry_id"] = entry["id"]
-                    st.success(f"'{entry['title']}' geladen.")
+                    st.session_state["current_title"]    = entry["title"]
                     st.rerun()
-            with col2:
-                if st.button("Verwijder artikel", use_container_width=True):
+            with cols[1]:
+                if st.button("🗑", key=f"del_{entry['id']}", use_container_width=True,
+                             help="Verwijder dit artikel en bijbehorende audio"):
                     delete_from_library(entry["id"])
                     if st.session_state.get("current_entry_id") == entry["id"]:
-                        st.session_state.pop("extracted_text", None)
-                        st.session_state.pop("current_entry_id", None)
-                    st.success(f"'{entry['title']}' verwijderd.")
+                        for k in ("extracted_text", "current_source",
+                                  "current_entry_id", "current_title"):
+                            st.session_state.pop(k, None)
                     st.rerun()
 
-    st.divider()
 
-    # ── Tekstgebied ───────────────────────────────────────────────────────────
+# ── Hoofdsecties ──────────────────────────────────────────────────────────────
+
+def render_input_section():
+    st.subheader("1. Tekst inladen")
+    tab_pdf, tab_url = st.tabs(["📄 PDF upload", "🔗 URL invoer"])
+
+    with tab_pdf:
+        uploaded = st.file_uploader(
+            "Kies een PDF", type=["pdf"], label_visibility="collapsed",
+        )
+        if uploaded and st.button("Tekst extraheren", key="extract_pdf"):
+            with st.spinner("PDF verwerken..."):
+                text = extract_text_pdf(uploaded)
+            if text:
+                st.session_state["extracted_text"]   = text
+                st.session_state["current_source"]   = uploaded.name
+                st.session_state["current_entry_id"] = None
+                st.session_state["current_title"]    = uploaded.name.rsplit(".", 1)[0]
+                st.rerun()
+
+    with tab_url:
+        url = st.text_input(
+            "URL", placeholder="https://example.com/artikel", label_visibility="collapsed",
+        )
+        if st.button("Tekst extraheren", key="extract_url"):
+            if not url.strip():
+                st.error("Voer een URL in.")
+            else:
+                with st.spinner("URL ophalen..."):
+                    text = extract_text_url(url.strip())
+                if text:
+                    st.session_state["extracted_text"]   = text
+                    st.session_state["current_source"]   = url.strip()
+                    st.session_state["current_entry_id"] = None
+                    st.session_state["current_title"]    = generate_title(text)
+                    st.rerun()
+
+
+def render_text_section() -> str:
+    st.subheader("2. Tekst bewerken")
+
     current_text  = st.session_state.get("extracted_text", "")
     editable_text = st.text_area(
-        "Geëxtraheerde tekst (bewerkbaar)",
-        value=current_text,
-        height=300,
-        placeholder="Tekst verschijnt hier na extractie. U kunt de tekst aanpassen voor het voorlezen.",
+        "Tekst", value=current_text, height=280,
+        placeholder="Tekst verschijnt hier na extractie of bij het laden uit de bibliotheek.",
+        label_visibility="collapsed",
     )
 
-    # ── Opslaan in bibliotheek ────────────────────────────────────────────────
     if editable_text.strip():
-        with st.expander("Opslaan in bibliotheek"):
-            default_title = st.session_state.get("current_source", "")[:60]
-            save_title = st.text_input("Titel", value=default_title)
-            if st.button("Opslaan"):
-                if not save_title.strip():
-                    st.error("Geef een titel op.")
-                else:
-                    entry_id = add_to_library(
-                        title=save_title.strip(),
-                        source=st.session_state.get("current_source", ""),
-                        text=editable_text.strip(),
-                    )
-                    st.session_state["current_entry_id"] = entry_id
-                    st.success(f"Opgeslagen als '{save_title.strip()}'.")
+        chars = len(editable_text)
+        words = len(editable_text.split())
+        lang  = detect_language(editable_text).upper() or "?"
+        cost  = (chars / 1_000_000) * PRICE_PER_1M_CHARS
 
-    st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tekens",    f"{chars:,}".replace(",", "."))
+        c2.metric("Woorden",   f"{words:,}".replace(",", "."))
+        c3.metric("Taal",      lang)
+        c4.metric("TTS-kosten", f"${cost:.3f}")
 
-    # ── Taaldetectie & vertaling ──────────────────────────────────────────────
-    current_editable = editable_text.strip()
-    detected_lang    = ""
-    if current_editable:
-        try:
-            detected_lang = detect(current_editable)
-        except LangDetectException:
-            detected_lang = ""
+    return editable_text
 
-    if detected_lang and detected_lang != "nl":
-        if st.button(f"Vertaal naar Nederlands ({detected_lang.upper()} gedetecteerd)"):
+
+def render_save_section(editable_text: str):
+    if not editable_text.strip():
+        return
+    with st.expander("💾 Opslaan in bibliotheek"):
+        default = st.session_state.get("current_title") or generate_title(editable_text)
+        title   = st.text_input("Titel", value=default[:80])
+        if st.button("Opslaan", type="primary"):
+            if not title.strip():
+                st.error("Geef een titel op.")
+                return
+            entry_id = add_to_library(
+                title=title.strip(),
+                source=st.session_state.get("current_source", ""),
+                text=editable_text.strip(),
+            )
+            st.session_state["current_entry_id"] = entry_id
+            st.session_state["current_title"]    = title.strip()
+            st.success(f"Opgeslagen als '{title.strip()}'.")
+            st.rerun()
+
+
+def render_translate_section(editable_text: str):
+    text = editable_text.strip()
+    if not text:
+        return
+    lang = detect_language(text)
+    if lang and lang != "nl":
+        if st.button(f"🌍 Vertaal naar Nederlands ({lang.upper()} gedetecteerd)"):
             with st.spinner("Tekst vertalen met Claude Sonnet..."):
-                translated = translate_to_dutch(current_editable)
+                translated = translate_to_dutch(text)
             if translated:
                 st.session_state["extracted_text"]   = translated
                 st.session_state["current_entry_id"] = None
-                st.success("Tekst vertaald naar Nederlands.")
+                st.success("Vertaald naar Nederlands.")
                 st.rerun()
 
-    st.divider()
 
-    # ── Stemkeuze & voorlezen ─────────────────────────────────────────────────
-    voice_options  = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-    selected_voice = st.selectbox("Stem", options=voice_options, index=4)
+def render_tts_section(editable_text: str):
+    st.subheader("3. Voorlezen")
 
-    if st.button("Voorlezen", type="primary"):
-        text_to_read = editable_text.strip()
-        if not text_to_read:
-            st.error("Er is geen tekst om voor te lezen. Extraheer eerst tekst via PDF of URL.")
+    entry_id = st.session_state.get("current_entry_id")
+
+    cols = st.columns([2, 1])
+    with cols[0]:
+        if entry_id:
+            labels = [
+                ("🔊 " if has_cached_audio(entry_id, v) else "  ") + v
+                for v in VOICE_OPTIONS
+            ]
+            idx   = st.selectbox(
+                "Stem", range(len(VOICE_OPTIONS)),
+                format_func=lambda i: labels[i], index=4,
+            )
+            voice = VOICE_OPTIONS[idx]
+            st.caption("🔊 = audio aanwezig in cache (geen API-kosten)")
         else:
-            entry_id = st.session_state.get("current_entry_id")
+            voice = st.selectbox("Stem", VOICE_OPTIONS, index=4)
 
-            # Controleer audiocache
-            cached = load_cached_audio(entry_id, selected_voice) if entry_id else None
+    with cols[1]:
+        st.write("")
+        st.write("")
+        play = st.button("▶️  Voorlezen", type="primary", use_container_width=True)
 
-            if cached:
-                st.info("Audio geladen uit lokale cache (geen API-kosten).")
-                audio_bytes = cached
-            else:
-                try:
-                    lang = detect(text_to_read)
-                except LangDetectException:
-                    lang = "onbekend"
+    if not play:
+        return
 
-                openai_client = get_openai_client()
-                with st.spinner(f"Audio genereren (taal: {lang})..."):
-                    audio_bytes = text_to_audio(openai_client, text_to_read, selected_voice)
+    text_to_read = editable_text.strip()
+    if not text_to_read:
+        st.error("Er is geen tekst om voor te lezen.")
+        return
 
-                # Sla op in cache als het artikel in de bibliotheek staat
-                if audio_bytes and entry_id:
-                    save_cached_audio(entry_id, selected_voice, audio_bytes)
-                    st.success("Audio opgeslagen — volgende keer gratis afspelen.")
+    cached = load_cached_audio(entry_id, voice)
+    if cached:
+        st.success("⚡ Direct uit cache geladen — geen API-kosten.")
+        audio_bytes = cached
+    else:
+        client = get_openai_client()
+        if not client:
+            st.error("OpenAI API-sleutel ontbreekt.")
+            return
+        audio_bytes = text_to_audio_parallel(client, text_to_read, voice)
+        if audio_bytes and entry_id:
+            save_cached_audio(entry_id, voice, audio_bytes)
+            st.success("✅ Audio gegenereerd en opgeslagen in cache.")
+        elif audio_bytes:
+            st.info("Tip: sla de tekst op in de bibliotheek om de audio te bewaren.")
 
-            if audio_bytes:
-                st.audio(audio_bytes, format="audio/mp3")
+    if audio_bytes:
+        st.audio(audio_bytes, format="audio/mp3")
+        title_safe = re.sub(
+            r"[^\w\-]", "_",
+            st.session_state.get("current_title", "audio") or "audio",
+        )[:50]
+        st.download_button(
+            "⬇️  Download MP3",
+            data=audio_bytes,
+            file_name=f"{title_safe}_{voice}.mp3",
+            mime="audio/mpeg",
+        )
 
-                # Downloadknop
-                st.download_button(
-                    label="Download MP3",
-                    data=audio_bytes,
-                    file_name=f"{entry_id or 'audio'}_{selected_voice}.mp3",
-                    mime="audio/mpeg",
-                )
-            else:
-                st.error("Audio kon niet worden gegenereerd.")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    render_sidebar()
+
+    st.title("🎧 Voorlezen")
+    st.caption("Upload een PDF of voer een URL in en laat de tekst voorlezen.")
+
+    render_input_section()
+    st.divider()
+    editable_text = render_text_section()
+    render_save_section(editable_text)
+    render_translate_section(editable_text)
+    st.divider()
+    render_tts_section(editable_text)
 
 
 if __name__ == "__main__":
