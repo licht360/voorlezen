@@ -146,23 +146,65 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+}
+
+
+def fetch_html(url: str) -> str | None:
+    """Haal HTML op met meerdere strategieën (sommige sites blokkeren bots)."""
+    # 1. Trafilatura's eigen fetcher
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded and len(downloaded) > 500:
+            return downloaded
+    except Exception:
+        pass
+
+    # 2. Fallback: urllib met realistische browser-headers
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
 def extract_text_url(url: str) -> str:
     if not is_valid_url(url):
         st.error("Ongeldige URL. Gebruik http:// of https://")
         return ""
-    try:
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            st.error("URL kon niet worden opgehaald.")
-            return ""
-        text = trafilatura.extract(downloaded)
-        if not text:
-            st.error("Geen hoofdtekst gevonden op de opgegeven URL.")
-            return ""
-        return text.strip()
-    except Exception as e:
-        st.error(f"URL-extractie mislukt: {e}")
+
+    html = fetch_html(url)
+    if not html:
+        st.error("URL kon niet worden opgehaald.")
         return ""
+
+    # Probeer meerdere extractiestrategieën
+    for kwargs in (
+        {},
+        {"favor_recall": True},
+        {"favor_recall": True, "include_comments": False, "include_tables": True},
+    ):
+        try:
+            text = trafilatura.extract(html, **kwargs)
+            if text and len(text.strip()) > 100:
+                return text.strip()
+        except Exception:
+            continue
+
+    st.error(
+        "Geen hoofdtekst gevonden. De pagina gebruikt mogelijk JavaScript "
+        "om de tekst te tonen, of blokkeert geautomatiseerde toegang."
+    )
+    return ""
 
 
 # ── Vertaling & samenvatting ──────────────────────────────────────────────────
