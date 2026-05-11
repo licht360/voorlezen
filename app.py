@@ -93,6 +93,13 @@ def load_audio(entry_id: str) -> bytes | None:
     return None
 
 
+def get_library_entry(entry_id: str) -> dict | None:
+    for entry in load_library():
+        if entry.get("id") == entry_id:
+            return entry
+    return None
+
+
 # ── API-clients ───────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -506,28 +513,75 @@ def render_sidebar():
                 st.caption(f"📍 {src_display}")
 
             audio_bytes = load_audio(entry["id"])
-            if audio_bytes:
-                st.audio(audio_bytes, format="audio/mpeg")
+            if not audio_bytes:
+                st.warning("MP3-bestand niet gevonden.")
 
             cols = st.columns([3, 1])
             with cols[0]:
-                if audio_bytes:
-                    title_safe = re.sub(r"[^\w\-]", "_", entry["title"])[:50]
-                    st.download_button(
-                        "⬇️ MP3",
-                        data=audio_bytes,
-                        file_name=f"{title_safe}.mp3",
-                        mime="audio/mpeg",
-                        key=f"dl_{entry['id']}",
-                        use_container_width=True,
-                    )
+                if st.button(
+                    "Voorlezen",
+                    key=f"play_saved_{entry['id']}",
+                    disabled=not audio_bytes,
+                    use_container_width=True,
+                ):
+                    st.session_state["active_library_entry_id"] = entry["id"]
+                    st.session_state.pop("pending_result", None)
+                    st.session_state.pop("show_pending_audio", None)
+                    st.rerun()
             with cols[1]:
                 if st.button(
                     "🗑", key=f"del_{entry['id']}",
                     use_container_width=True, help="Verwijderen",
                 ):
                     delete_from_library(entry["id"])
+                    if st.session_state.get("active_library_entry_id") == entry["id"]:
+                        st.session_state.pop("active_library_entry_id", None)
                     st.rerun()
+
+
+def render_saved_player():
+    entry_id = st.session_state.get("active_library_entry_id")
+    if not entry_id:
+        return False
+
+    entry = get_library_entry(entry_id)
+    audio_bytes = load_audio(entry_id)
+    if not entry or not audio_bytes:
+        st.session_state.pop("active_library_entry_id", None)
+        return False
+
+    icon = source_icon(entry)
+    st.subheader(f"{icon} {entry['title']}")
+    st.caption(
+        f"Opgeslagen op {entry.get('date', '?')} · "
+        f"🎤 {entry.get('voice', '?')} · "
+        f"{entry.get('chars', 0):,} tekens".replace(",", ".")
+    )
+
+    source = entry.get("source", "")
+    if source:
+        st.caption(f"Bron: {source}")
+
+    st.audio(audio_bytes, format="audio/mpeg")
+
+    cols = st.columns([2, 1])
+    with cols[0]:
+        title_safe = re.sub(r"[^\w\-]", "_", entry["title"])[:50]
+        st.download_button(
+            "⬇️ Download MP3",
+            data=audio_bytes,
+            file_name=f"{title_safe}.mp3",
+            mime="audio/mpeg",
+            use_container_width=True,
+            key=f"main_dl_{entry_id}",
+        )
+    with cols[1]:
+        if st.button("Sluiten", use_container_width=True):
+            st.session_state.pop("active_library_entry_id", None)
+            st.rerun()
+
+    st.divider()
+    return True
 
 
 # ── Hoofdscherm ───────────────────────────────────────────────────────────────
@@ -535,6 +589,8 @@ def render_sidebar():
 def render_main():
     st.title("🎧 Voorlezen")
     st.caption("Upload een PDF of voer een URL in en laat het direct voorlezen.")
+
+    render_saved_player()
 
     # Instellingen
     cols = st.columns([2, 3])
@@ -583,12 +639,14 @@ def render_main():
     ready = source_type is not None
 
     if st.button(
-        "▶️  Voorlezen",
+        "Start conversie",
         type="primary",
         use_container_width=True,
         disabled=not ready,
     ) and ready:
         st.session_state.pop("pending_result", None)
+        st.session_state.pop("show_pending_audio", None)
+        st.session_state.pop("active_library_entry_id", None)
         result = process_to_audio(source_type, source, source_data, voice, auto_translate)
         if result:
             st.session_state["pending_result"] = result
@@ -606,7 +664,11 @@ def render_main():
         f"{pending['chars']:,} tekens".replace(",", ".")
     )
 
-    st.audio(pending["audio_bytes"], format="audio/mpeg")
+    if st.button("Voorlezen", type="primary", use_container_width=True):
+        st.session_state["show_pending_audio"] = True
+
+    if st.session_state.get("show_pending_audio"):
+        st.audio(pending["audio_bytes"], format="audio/mpeg")
 
     st.divider()
 
