@@ -637,19 +637,33 @@ def render_main():
             st.info(f"🔗 Klaar om te verwerken: **{preview}**")
 
     ready = source_type is not None
+    current_input_signature = f"{source_type}:{source}" if ready else None
+    pending = st.session_state.get("pending_result")
 
-    if st.button(
-        "Start conversie",
-        type="primary",
-        use_container_width=True,
-        disabled=not ready,
-    ) and ready:
+    if pending and pending.get("input_signature") != current_input_signature:
         st.session_state.pop("pending_result", None)
         st.session_state.pop("show_pending_audio", None)
-        st.session_state.pop("active_library_entry_id", None)
-        result = process_to_audio(source_type, source, source_data, voice, auto_translate)
-        if result:
-            st.session_state["pending_result"] = result
+        pending = None
+
+    primary_label = "Voorlezen" if pending else "Start conversie"
+
+    if st.button(
+        primary_label,
+        type="primary",
+        use_container_width=True,
+        disabled=not ready and not pending,
+    ):
+        if pending:
+            st.session_state["show_pending_audio"] = True
+        elif ready:
+            st.session_state.pop("pending_result", None)
+            st.session_state.pop("show_pending_audio", None)
+            st.session_state.pop("active_library_entry_id", None)
+            result = process_to_audio(source_type, source, source_data, voice, auto_translate)
+            if result:
+                result["input_signature"] = current_input_signature
+                st.session_state["pending_result"] = result
+                st.rerun()
 
     # Resultaat
     pending = st.session_state.get("pending_result")
@@ -663,9 +677,6 @@ def render_main():
         f"🎤 {pending['voice']} · "
         f"{pending['chars']:,} tekens".replace(",", ".")
     )
-
-    if st.button("Voorlezen", type="primary", use_container_width=True):
-        st.session_state["show_pending_audio"] = True
 
     if st.session_state.get("show_pending_audio"):
         st.audio(pending["audio_bytes"], format="audio/mpeg")
