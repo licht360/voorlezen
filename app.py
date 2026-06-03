@@ -417,13 +417,17 @@ def process_to_audio(source_type: str, source: str, source_data,
 
     try:
         # 1. Tekstextractie (0% → 20%)
-        progress.progress(0.05, text="📄 Tekst extraheren...")
+        progress.progress(0.05, text="📄 Tekst voorbereiden...")
         if source_type == "pdf":
             text = extract_text_pdf(source_data)
-        else:
+        elif source_type == "url":
             text = extract_text_url(source)
+        else:  # source_type == "text"
+            text = source_data.strip() if source_data else ""
 
         if not text:
+            if source_type == "text":
+                st.error("Geen tekst ingevoerd.")
             return None
 
         progress.progress(0.20, text=f"📄 Tekst gelezen ({len(text):,} tekens)".replace(",", "."))
@@ -481,6 +485,8 @@ def source_icon(entry: dict) -> str:
         return "📄"
     if st_type == "url":
         return "🔗"
+    if st_type == "text":
+        return "✍️"
     src = entry.get("source", "")
     return "🔗" if src.startswith(("http://", "https://")) else "📄"
 
@@ -608,7 +614,9 @@ def render_main():
     st.divider()
 
     # Input
-    tab_pdf, tab_url = st.tabs(["📄 PDF upload", "🔗 URL invoer"])
+    tab_pdf, tab_url, tab_text = st.tabs(
+        ["📄 PDF upload", "🔗 URL invoer", "✍️ Tekst invoer"]
+    )
 
     source_type = None
     source      = None
@@ -635,6 +643,21 @@ def render_main():
             source_data = None
             preview = source if len(source) <= 60 else source[:57] + "..."
             st.info(f"🔗 Klaar om te verwerken: **{preview}**")
+
+    with tab_text:
+        pasted = st.text_area(
+            "Plak of typ hier de tekst",
+            height=200,
+            placeholder="Plak hier de tekst die je wilt laten voorlezen...",
+            label_visibility="collapsed",
+            key="pasted_text",
+        )
+        if pasted.strip() and not source_type:
+            source_type = "text"
+            source      = "Ingevoerde tekst"
+            source_data = pasted
+            chars = len(pasted.strip())
+            st.info(f"✍️ Klaar om te verwerken: **{chars:,} tekens ingevoerd**".replace(",", "."))
 
     ready = source_type is not None
     current_input_signature = f"{source_type}:{source}" if ready else None
@@ -671,7 +694,8 @@ def render_main():
         return
 
     st.divider()
-    icon = "📄" if pending["source_type"] == "pdf" else "🔗"
+    icons = {"pdf": "📄", "url": "🔗", "text": "✍️"}
+    icon  = icons.get(pending["source_type"], "📄")
     st.subheader(f"{icon} {pending['title']}")
     st.caption(
         f"🎤 {pending['voice']} · "
