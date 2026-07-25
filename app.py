@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -10,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import anthropic
+import openai
 import pdfplumber
 import streamlit as st
 import trafilatura
@@ -109,7 +111,8 @@ def get_openai_client() -> OpenAI | None:
         api_key = st.secrets["OPENAI_API_KEY"]
     except Exception:
         api_key = os.environ.get("OPENAI_API_KEY")
-    return OpenAI(api_key=api_key) if api_key else None
+    # max_retries=4: OpenAI SDK doet retries op 429/5xx/connection errors
+    return OpenAI(api_key=api_key, max_retries=4, timeout=90.0) if api_key else None
 
 
 @st.cache_resource
@@ -366,8 +369,33 @@ def split_text(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
     return [c for c in chunks if c]
 
 
+TTS_MAX_ATTEMPTS = 4  # extra bovenop de retries die de OpenAI-SDK zelf al doet
+
+
 def _tts_chunk(client: OpenAI, voice: str, chunk: str) -> bytes:
-    return client.audio.speech.create(model="tts-1", voice=voice, input=chunk).content
+    """TTS voor één chunk, met eigen retry+backoff bovenop de SDK-retries.
+
+    OpenAI's tts-1 geeft af en toe een tijdelijke 500 (server_error) terug.
+    De SDK retryt zelf al op 429/5xx, maar bij aanhoudende drukte is een
+    extra, tragere retry-laag nodig om chunks niet voortijdig te laten falen.
+    """
+    last_error: Exception | None = None
+    for attempt in range(TTS_MAX_ATTEMPTS):
+        try:
+            return client.audio.speech.create(
+                model="tts-1", voice=voice, input=chunk
+            ).content
+        except (openai.APIStatusError, openai.APIConnectionError, openai.APITimeoutError) as e:
+            last_error = e
+            is_retryable = (
+                isinstance(e, (openai.APIConnectionError, openai.APITimeoutError))
+                or getattr(e, "status_code", 0) >= 500
+                or getattr(e, "status_code", 0) == 429
+            )
+            if not is_retryable or attempt == TTS_MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s
+    raise last_error  # onbereikbaar, maar houdt type-checkers tevreden
 
 
 def text_to_audio(client: OpenAI, text: str, voice: str,
@@ -384,6 +412,7 @@ def text_to_audio(client: OpenAI, text: str, voice: str,
 
     results: list[bytes | None] = [None] * len(chunks)
     completed = 0
+    failed_chunks: list[int] = []
 
     with ThreadPoolExecutor(max_workers=TTS_PARALLEL_WORKERS) as executor:
         futures = {
@@ -395,16 +424,23 @@ def text_to_audio(client: OpenAI, text: str, voice: str,
             try:
                 results[idx] = future.result()
             except Exception as e:
-                st.error(f"TTS API-fout bij chunk {idx + 1}: {e}")
-                return b""
+                failed_chunks.append(idx)
+                st.warning(f"Chunk {idx + 1} bleef falen na meerdere pogingen: {e}")
+                continue
             completed += 1
             progress_bar.progress(
                 base + (completed / len(chunks)) * span,
                 text=f"🎤 Audio genereren... ({completed}/{len(chunks)} chunks)",
             )
 
-    if any(r is None for r in results):
+    if failed_chunks:
+        st.error(
+            f"Audio kon niet volledig gegenereerd worden — "
+            f"{len(failed_chunks)} van {len(chunks)} delen mislukten na herhaalde pogingen. "
+            f"Probeer het opnieuw."
+        )
         return b""
+
     return b"".join(results)
 
 
