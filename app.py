@@ -1,10 +1,14 @@
 # requirements: streamlit, pdfplumber, trafilatura, openai, langdetect, anthropic
 
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
+import ssl
 import time
+import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +25,14 @@ from langdetect import DetectorFactory, LangDetectException, detect
 from openai import OpenAI
 
 DetectorFactory.seed = 0  # zonder seed kan langdetect per run een andere taal kiezen
+
+# Python van python.org op macOS heeft geen eigen rootcertificaten, waardoor
+# urllib elke https-verbinding weigert. certifi (komt mee met openai) heeft ze wel.
+try:
+    import certifi
+    SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    SSL_CONTEXT = ssl.create_default_context()
 
 # ── Configuratie ──────────────────────────────────────────────────────────────
 DATA_DIR     = Path(__file__).parent / "data"
@@ -53,9 +65,148 @@ st.set_page_config(
 )
 
 
+# ── Secrets & API-clients ─────────────────────────────────────────────────────
+
+def get_secret(name: str) -> str | None:
+    """Waarde uit st.secrets, anders uit de omgeving, anders None."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name)
+
+
+@st.cache_resource
+def get_openai_client() -> OpenAI | None:
+    api_key = get_secret("OPENAI_API_KEY")
+    # max_retries=4: OpenAI SDK doet retries op 429/5xx/connection errors
+    return OpenAI(api_key=api_key, max_retries=4, timeout=90.0) if api_key else None
+
+
+@st.cache_resource
+def get_anthropic_client() -> anthropic.Anthropic | None:
+    api_key = get_secret("ANTHROPIC_API_KEY")
+    return anthropic.Anthropic(api_key=api_key, max_retries=4) if api_key else None
+
+
+# ── Online opslag (privé GitHub-repository) ───────────────────────────────────
+#
+# Streamlit Cloud wist data/ bij elke herstart of slaapstand. Met de secrets
+# LIBRARY_REPO ("eigenaar/naam") en LIBRARY_TOKEN staat de bibliotheek daarom
+# in een privé GitHub-repository: de lijst in bibliotheek.json en elke MP3 als
+# bestand bij de release "audio". data/audio is dan alleen nog een cache.
+# Zonder die secrets blijft alles lokaal in data/.
+
+GITHUB_API    = "https://api.github.com"
+GITHUB_UPLOAD = "https://uploads.github.com"
+REMOTE_INDEX  = "bibliotheek.json"
+REMOTE_TAG    = "audio"
+
+
+def remote_config() -> tuple[str, str] | None:
+    repo, token = get_secret("LIBRARY_REPO"), get_secret("LIBRARY_TOKEN")
+    return (repo, token) if repo and token else None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_GITHUB_OPENER = urllib.request.build_opener(
+    _NoRedirect, urllib.request.HTTPSHandler(context=SSL_CONTEXT)
+)
+
+
+def _github(method: str, url: str, token: str, body=None, *,
+            content_type: str = "application/json",
+            accept: str = "application/vnd.github+json",
+            timeout: float = 30.0) -> bytes:
+    """Eén aanroep naar de GitHub-API; gooit urllib.error.HTTPError bij een fout."""
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body).encode("utf-8")
+    headers = {
+        "Authorization":        f"Bearer {token}",
+        "Accept":               accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent":           "voorlezen-app",
+    }
+    if body is not None:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with _GITHUB_OPENER.open(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location")
+        if e.code in (301, 302, 307) and location:
+            # Downloads lopen via een tijdelijke link op een andere server. Die
+            # weigert het verzoek als de Authorization-header meekomt, vandaar
+            # dat de redirect hier met de hand en zonder header wordt gevolgd.
+            with urllib.request.urlopen(location, timeout=timeout, context=SSL_CONTEXT) as response:
+                return response.read()
+        raise
+
+
+def _remote_read_index(repo: str, token: str) -> tuple[list[dict], str | None]:
+    """De bibliotheeklijst plus de versie (sha) die nodig is om hem te overschrijven."""
+    try:
+        raw = json.loads(_github("GET", f"{GITHUB_API}/repos/{repo}/contents/{REMOTE_INDEX}", token))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return [], None  # nog geen bibliotheek aangemaakt
+        raise
+    return json.loads(base64.b64decode(raw["content"]).decode("utf-8")), raw["sha"]
+
+
+def _remote_update_index(repo: str, token: str, change) -> None:
+    """Lees de lijst, pas `change(lijst)` toe en schrijf hem terug.
+
+    Heeft een ander apparaat intussen ook geschreven (409), dan wordt de
+    wijziging één keer opnieuw toegepast op de nieuwste versie.
+    """
+    for attempt in range(2):
+        library, sha = _remote_read_index(repo, token)
+        change(library)
+        content = json.dumps(library, ensure_ascii=False, indent=2).encode("utf-8")
+        body = {"message": "Bibliotheek bijgewerkt", "content": base64.b64encode(content).decode("ascii")}
+        if sha:
+            body["sha"] = sha
+        try:
+            _github("PUT", f"{GITHUB_API}/repos/{repo}/contents/{REMOTE_INDEX}", token, body)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 409 or attempt:
+                raise
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _remote_library(repo: str, _token: str) -> list[dict]:
+    """De online lijst, 60 seconden onthouden zodat niet elke klik GitHub aanroept."""
+    return _remote_read_index(repo, _token)[0]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _remote_release_id(repo: str, _token: str) -> int:
+    """Id van de release waar de MP3's bij horen; wordt aangemaakt als hij ontbreekt."""
+    try:
+        release = json.loads(_github("GET", f"{GITHUB_API}/repos/{repo}/releases/tags/{REMOTE_TAG}", _token))
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        release = json.loads(_github(
+            "POST", f"{GITHUB_API}/repos/{repo}/releases", _token,
+            {"tag_name": REMOTE_TAG, "name": "Audio van de Voorlezen-bibliotheek"},
+        ))
+    return release["id"]
+
+
+def _remote_asset_url(repo: str, asset_id: int) -> str:
+    return f"{GITHUB_API}/repos/{repo}/releases/assets/{asset_id}"
+
+
 # ── Bibliotheek (alleen MP3 + metadata) ───────────────────────────────────────
 
-def load_library() -> list[dict]:
+def _load_local_library() -> list[dict]:
     if LIBRARY_FILE.exists():
         try:
             return json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
@@ -64,7 +215,7 @@ def load_library() -> list[dict]:
     return []
 
 
-def save_library(library: list[dict]) -> None:
+def _save_local_library(library: list[dict]) -> None:
     # Eerst naar een tijdelijk bestand: een onderbroken schrijfactie laat dan
     # de bestaande bibliotheek heel.
     tmp = LIBRARY_FILE.with_suffix(".tmp")
@@ -72,13 +223,27 @@ def save_library(library: list[dict]) -> None:
     tmp.replace(LIBRARY_FILE)
 
 
+def load_library_or_error() -> tuple[list[dict], str | None]:
+    """De bibliotheek (online als die is ingesteld, anders lokaal) plus een
+    foutmelding als de online opslag onbereikbaar is."""
+    remote = remote_config()
+    if not remote:
+        return _load_local_library(), None
+    try:
+        return _remote_library(*remote), None
+    except Exception as e:
+        return [], str(e)
+
+
+def load_library() -> list[dict]:
+    return load_library_or_error()[0]
+
+
 def add_to_library(title: str, source_type: str, source: str,
                    voice: str, chars: int, audio_bytes: bytes) -> str:
+    """Bewaar een artikel. Gooit een fout als de online opslag het niet aanneemt."""
     entry_id = uuid.uuid4().hex[:12]
-    (AUDIO_DIR / f"{entry_id}.mp3").write_bytes(audio_bytes)
-
-    library = load_library()
-    library.insert(0, {
+    entry = {
         "id":          entry_id,
         "title":       title,
         "source_type": source_type,
@@ -86,32 +251,83 @@ def add_to_library(title: str, source_type: str, source: str,
         "voice":       voice,
         "chars":       chars,
         "date":        datetime.now().strftime("%Y-%m-%d %H:%M"),
-    })
-    save_library(library)
+    }
+
+    remote = remote_config()
+    if remote:
+        repo, token = remote
+        asset = json.loads(_github(
+            "POST",
+            f"{GITHUB_UPLOAD}/repos/{repo}/releases/{_remote_release_id(repo, token)}/assets"
+            f"?name={entry_id}.mp3",
+            token, audio_bytes, content_type="audio/mpeg", timeout=300,
+        ))
+        entry["asset_id"] = asset["id"]
+        _remote_update_index(repo, token, lambda library: library.insert(0, entry))
+        _remote_library.clear()
+    else:
+        _save_local_library([entry] + _load_local_library())
+
+    (AUDIO_DIR / f"{entry_id}.mp3").write_bytes(audio_bytes)
     return entry_id
 
 
 def delete_from_library(entry_id: str) -> None:
-    library = [e for e in load_library() if e["id"] != entry_id]
-    save_library(library)
-    (AUDIO_DIR / f"{entry_id}.mp3").unlink(missing_ok=True)
-    # Backward compatibility: oude bestandsnamen
-    for old in AUDIO_DIR.glob(f"{entry_id}_*.mp3"):
-        old.unlink(missing_ok=True)
+    remote = remote_config()
+    if remote:
+        repo, token = remote
+        removed: list[dict] = []
+
+        def drop(library: list[dict]) -> None:
+            for entry in [e for e in library if e["id"] == entry_id]:
+                library.remove(entry)
+                removed.append(entry)
+
+        _remote_update_index(repo, token, drop)
+        _remote_library.clear()
+        for entry in removed:
+            if entry.get("asset_id"):
+                try:
+                    _github("DELETE", _remote_asset_url(repo, entry["asset_id"]), token)
+                except Exception:
+                    pass  # het artikel is al uit de lijst; een los bestand is onschadelijk
+    else:
+        _save_local_library([e for e in _load_local_library() if e["id"] != entry_id])
+
+    for path in AUDIO_DIR.glob(f"{entry_id}*.mp3"):
+        path.unlink(missing_ok=True)
 
 
-def audio_path(entry_id: str) -> Path | None:
-    """Pad naar de MP3 van een artikel, of None als die ontbreekt."""
+def _local_audio_path(entry_id: str) -> Path | None:
     path = AUDIO_DIR / f"{entry_id}.mp3"
     if path.exists():
         return path
-    # Backward compatibility: oude bestandsnamen
+    # Backward compatibility: oude bestandsnamen (met de stem in de naam)
     return next(AUDIO_DIR.glob(f"{entry_id}_*.mp3"), None)
 
 
-def load_audio(entry_id: str) -> bytes | None:
-    path = audio_path(entry_id)
-    return path.read_bytes() if path else None
+def has_audio(entry: dict) -> bool:
+    """Is de MP3 beschikbaar, lokaal of online? Leest het bestand zelf niet in."""
+    if _local_audio_path(entry["id"]):
+        return True
+    return bool(remote_config() and entry.get("asset_id"))
+
+
+def load_audio(entry: dict) -> bytes | None:
+    """De MP3 van een artikel; haalt hem zo nodig online op en bewaart hem lokaal."""
+    path = _local_audio_path(entry["id"])
+    if path:
+        return path.read_bytes()
+    remote = remote_config()
+    if remote and entry.get("asset_id"):
+        repo, token = remote
+        audio = _github(
+            "GET", _remote_asset_url(repo, entry["asset_id"]), token,
+            accept="application/octet-stream", timeout=300,
+        )
+        (AUDIO_DIR / f"{entry['id']}.mp3").write_bytes(audio)
+        return audio
+    return None
 
 
 def get_library_entry(entry_id: str) -> dict | None:
@@ -119,29 +335,6 @@ def get_library_entry(entry_id: str) -> dict | None:
         if entry.get("id") == entry_id:
             return entry
     return None
-
-
-# ── API-clients ───────────────────────────────────────────────────────────────
-
-@st.cache_resource
-def get_openai_client() -> OpenAI | None:
-    api_key = None
-    try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        api_key = os.environ.get("OPENAI_API_KEY")
-    # max_retries=4: OpenAI SDK doet retries op 429/5xx/connection errors
-    return OpenAI(api_key=api_key, max_retries=4, timeout=90.0) if api_key else None
-
-
-@st.cache_resource
-def get_anthropic_client() -> anthropic.Anthropic | None:
-    api_key = None
-    try:
-        api_key = st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-    return anthropic.Anthropic(api_key=api_key, max_retries=4) if api_key else None
 
 
 def _reply_text(response) -> str:
@@ -225,7 +418,7 @@ def fetch_html(url: str) -> str | None:
     # 2. Fallback: urllib met realistische browser-headers
     try:
         req = urllib.request.Request(url, headers=BROWSER_HEADERS)
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as response:
             return response.read().decode("utf-8", errors="ignore")
     except Exception:
         return None
@@ -613,10 +806,14 @@ def source_icon(entry: dict) -> str:
 
 
 def render_sidebar():
-    library = load_library()
+    library, error = load_library_or_error()
     st.sidebar.header("📚 Bibliotheek")
+    if error:
+        st.sidebar.error(f"De online bibliotheek is niet bereikbaar: {error}")
+        return
     n = len(library)
-    st.sidebar.caption(f"{n} artikel{'en' if n != 1 else ''} opgeslagen")
+    where = " · online bewaard" if remote_config() else ""
+    st.sidebar.caption(f"{n} artikel{'en' if n != 1 else ''} opgeslagen{where}")
 
     if not library:
         st.sidebar.info("Nog geen artikelen opgeslagen.")
@@ -641,8 +838,8 @@ def render_sidebar():
 
             # Alleen kijken of het bestand er is: de MP3 zelf wordt pas
             # ingelezen als het artikel wordt afgespeeld.
-            has_audio = audio_path(entry["id"]) is not None
-            if not has_audio:
+            playable = has_audio(entry)
+            if not playable:
                 st.warning("MP3-bestand niet gevonden.")
 
             cols = st.columns([3, 1])
@@ -650,7 +847,7 @@ def render_sidebar():
                 if st.button(
                     "Voorlezen",
                     key=f"play_saved_{entry['id']}",
-                    disabled=not has_audio,
+                    disabled=not playable,
                     use_container_width=True,
                 ):
                     st.session_state["active_library_entry_id"] = entry["id"]
@@ -662,7 +859,11 @@ def render_sidebar():
                     "🗑", key=f"del_{entry['id']}",
                     use_container_width=True, help="Verwijderen",
                 ):
-                    delete_from_library(entry["id"])
+                    try:
+                        delete_from_library(entry["id"])
+                    except Exception as e:
+                        st.error(f"Verwijderen mislukt: {e}")
+                        continue
                     if st.session_state.get("active_library_entry_id") == entry["id"]:
                         st.session_state.pop("active_library_entry_id", None)
                     st.rerun()
@@ -674,8 +875,19 @@ def render_saved_player():
         return False
 
     entry = get_library_entry(entry_id)
-    audio_bytes = load_audio(entry_id)
-    if not entry or not audio_bytes:
+    if not entry:
+        st.session_state.pop("active_library_entry_id", None)
+        return False
+    try:
+        if _local_audio_path(entry_id):
+            audio_bytes = load_audio(entry)
+        else:
+            with st.spinner("Audio ophalen uit de online bibliotheek..."):
+                audio_bytes = load_audio(entry)
+    except Exception as e:
+        st.error(f"Audio ophalen uit de online bibliotheek mislukt: {e}")
+        audio_bytes = None
+    if not audio_bytes:
         st.session_state.pop("active_library_entry_id", None)
         return False
 
@@ -863,18 +1075,25 @@ def render_main():
             if not title_input.strip():
                 st.error("Geef een titel op.")
             else:
-                add_to_library(
-                    title       = title_input.strip(),
-                    source_type = pending["source_type"],
-                    source      = pending["source"],
-                    voice       = pending["voice"],
-                    chars       = pending["chars"],
-                    audio_bytes = pending["audio_bytes"],
-                )
-                st.session_state.pop("pending_result", None)
-                st.session_state.pop("show_pending_audio", None)
-                st.session_state["flash"] = f"Opgeslagen in de bibliotheek: '{title_input.strip()}'"
-                st.rerun()
+                try:
+                    with st.spinner("Opslaan..."):
+                        add_to_library(
+                            title       = title_input.strip(),
+                            source_type = pending["source_type"],
+                            source      = pending["source"],
+                            voice       = pending["voice"],
+                            chars       = pending["chars"],
+                            audio_bytes = pending["audio_bytes"],
+                        )
+                except Exception as e:
+                    # Het resultaat blijft staan, zodat opnieuw proberen of
+                    # downloaden nog kan.
+                    st.error(f"Opslaan in de bibliotheek mislukt: {e}")
+                else:
+                    st.session_state.pop("pending_result", None)
+                    st.session_state.pop("show_pending_audio", None)
+                    st.session_state["flash"] = f"Opgeslagen in de bibliotheek: '{title_input.strip()}'"
+                    st.rerun()
 
     with cols[1]:
         title_safe = re.sub(r"[^\w\-]", "_", pending["title"])[:50]
@@ -889,7 +1108,42 @@ def render_main():
         )
 
 
+def _access_key(password: str) -> str:
+    """Sleutel voor in de link, afgeleid van het wachtwoord (niet het wachtwoord zelf)."""
+    return hashlib.sha256(f"voorlezen:{password}".encode("utf-8")).hexdigest()[:32]
+
+
+def require_password() -> None:
+    """Toegangscontrole als het secret APP_PASSWORD is ingesteld; anders vrije toegang.
+
+    Na inloggen komt er een sleutel in de link (?sleutel=...). Wie die link als
+    bladwijzer of op het beginscherm bewaart, hoeft het wachtwoord niet steeds
+    opnieuw in te typen.
+    """
+    password = get_secret("APP_PASSWORD")
+    if not password or st.session_state.get("authenticated"):
+        return
+
+    key = _access_key(password)
+    link_key = st.query_params.get("sleutel", "")
+    if hmac.compare_digest(link_key.encode("utf-8"), key.encode("utf-8")):
+        st.session_state["authenticated"] = True
+        return
+
+    st.title("🎧 Voorlezen")
+    entered = st.text_input("Wachtwoord", type="password")
+    if st.button("Inloggen", type="primary") or entered:
+        if hmac.compare_digest(entered.encode("utf-8"), password.encode("utf-8")):
+            st.session_state["authenticated"] = True
+            st.query_params["sleutel"] = key
+            st.rerun()
+        elif entered:
+            st.error("Onjuist wachtwoord.")
+    st.stop()
+
+
 def main():
+    require_password()
     render_sidebar()
     render_main()
 
