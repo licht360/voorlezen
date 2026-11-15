@@ -1,9 +1,11 @@
 # requirements: streamlit, pdfplumber, trafilatura, openai, langdetect, anthropic
 
+import hashlib
 import json
 import os
 import re
 import time
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -15,8 +17,10 @@ import openai
 import pdfplumber
 import streamlit as st
 import trafilatura
-from langdetect import LangDetectException, detect
+from langdetect import DetectorFactory, LangDetectException, detect
 from openai import OpenAI
+
+DetectorFactory.seed = 0  # zonder seed kan langdetect per run een andere taal kiezen
 
 # ── Configuratie ──────────────────────────────────────────────────────────────
 DATA_DIR     = Path(__file__).parent / "data"
@@ -26,9 +30,18 @@ LIBRARY_FILE = DATA_DIR / "texts.json"
 DATA_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
 
-MAX_PDF_SIZE_MB      = 25
-TTS_MAX_CHARS        = 4096
-TTS_PARALLEL_WORKERS = 8
+MAX_PDF_SIZE_MB = 25
+
+CLAUDE_MODEL   = "claude-sonnet-4-6"  # vertaling, titel en nood-extractie uit HTML
+TTS_MODEL      = "tts-1"
+TTS_HARD_LIMIT = 4096  # maximum aantal tekens per OpenAI TTS-aanvraag
+
+# De tekst wordt in stukken geknipt die tegelijk vertaald en ingesproken worden.
+# De wachttijd hangt daardoor af van het traagste stuk, niet van de totale
+# lengte. 2000 tekens houdt elk stuk snel en laat ruimte voor een vertaling die
+# langer uitvalt dan het origineel (die moet onder TTS_HARD_LIMIT blijven).
+CHUNK_CHARS = 2000
+MAX_WORKERS = 16
 
 VOICE_OPTIONS = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 
@@ -52,9 +65,11 @@ def load_library() -> list[dict]:
 
 
 def save_library(library: list[dict]) -> None:
-    LIBRARY_FILE.write_text(
-        json.dumps(library, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # Eerst naar een tijdelijk bestand: een onderbroken schrijfactie laat dan
+    # de bestaande bibliotheek heel.
+    tmp = LIBRARY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(library, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(LIBRARY_FILE)
 
 
 def add_to_library(title: str, source_type: str, source: str,
@@ -85,14 +100,18 @@ def delete_from_library(entry_id: str) -> None:
         old.unlink(missing_ok=True)
 
 
+def audio_path(entry_id: str) -> Path | None:
+    """Pad naar de MP3 van een artikel, of None als die ontbreekt."""
+    path = AUDIO_DIR / f"{entry_id}.mp3"
+    if path.exists():
+        return path
+    # Backward compatibility: oude bestandsnamen
+    return next(AUDIO_DIR.glob(f"{entry_id}_*.mp3"), None)
+
+
 def load_audio(entry_id: str) -> bytes | None:
-    new_path = AUDIO_DIR / f"{entry_id}.mp3"
-    if new_path.exists():
-        return new_path.read_bytes()
-    # Backward compatibility
-    for old in AUDIO_DIR.glob(f"{entry_id}_*.mp3"):
-        return old.read_bytes()
-    return None
+    path = audio_path(entry_id)
+    return path.read_bytes() if path else None
 
 
 def get_library_entry(entry_id: str) -> dict | None:
@@ -122,10 +141,29 @@ def get_anthropic_client() -> anthropic.Anthropic | None:
         api_key = st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-    return anthropic.Anthropic(api_key=api_key) if api_key else None
+    return anthropic.Anthropic(api_key=api_key, max_retries=4) if api_key else None
+
+
+def _reply_text(response) -> str:
+    """Alle tekstblokken uit een Claude-antwoord, aan elkaar."""
+    return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
 # ── Tekstextractie ────────────────────────────────────────────────────────────
+
+def clean_pdf_text(text: str) -> str:
+    """Herstel regels die de PDF-opmaak midden in een zin afbreekt.
+
+    Zonder dit leest de stem "voor- lezen" en pauzeert hij op elk regeleinde.
+    Regels die met een hoofdletter beginnen (koppen, nieuwe zinnen) blijven staan.
+    """
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    # Afbreekstreepje aan het regeleinde: "voor-\nlezen" → "voorlezen"
+    text = re.sub(r"(?<=[a-zà-ÿ])-\n+(?=[a-zà-ÿ])", "", text)
+    # Regel eindigt zonder leesteken en gaat klein verder → dezelfde zin
+    text = re.sub(r"(?<![.!?:;…\n])\n+(?=[a-zà-ÿ])", " ", text)
+    return text.strip()
+
 
 def extract_text_pdf(uploaded_file) -> str:
     if uploaded_file.size > MAX_PDF_SIZE_MB * 1024 * 1024:
@@ -145,7 +183,14 @@ def extract_text_pdf(uploaded_file) -> str:
     except Exception as e:
         st.error(f"PDF-extractie mislukt: {e}")
         return ""
-    return "\n\n".join(text_blocks)
+
+    text = clean_pdf_text("\n\n".join(text_blocks))
+    if not text:
+        st.error(
+            "Geen tekst gevonden in deze PDF. Waarschijnlijk is het een scan "
+            "(afbeeldingen zonder tekstlaag)."
+        )
+    return text
 
 
 def is_valid_url(url: str) -> bool:
@@ -179,7 +224,6 @@ def fetch_html(url: str) -> str | None:
 
     # 2. Fallback: urllib met realistische browser-headers
     try:
-        import urllib.request
         req = urllib.request.Request(url, headers=BROWSER_HEADERS)
         with urllib.request.urlopen(req, timeout=15) as response:
             return response.read().decode("utf-8", errors="ignore")
@@ -188,7 +232,11 @@ def fetch_html(url: str) -> str | None:
 
 
 def extract_jsonld(html: str) -> str:
-    """Zoek naar Schema.org Article-data in JSON-LD scripts."""
+    """Zoek de artikeltekst in Schema.org JSON-LD (veld `articleBody`).
+
+    Bewust niet `description`: dat is een samenvatting van een paar regels, en
+    die zou dan in plaats van het artikel worden voorgelezen.
+    """
     pattern = r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
     matches = re.findall(pattern, html, flags=re.DOTALL | re.IGNORECASE)
     candidates = []
@@ -200,21 +248,18 @@ def extract_jsonld(html: str) -> str:
         items = data if isinstance(data, list) else [data]
         # Voeg @graph-items toe (veelgebruikt patroon)
         for item in list(items):
-            if isinstance(item, dict) and "@graph" in item:
+            if isinstance(item, dict) and isinstance(item.get("@graph"), list):
                 items.extend(item["@graph"])
         for item in items:
             if not isinstance(item, dict):
                 continue
-            body = item.get("articleBody") or item.get("description")
+            body = item.get("articleBody")
             if body and isinstance(body, str):
                 candidates.append(body.strip())
-    if candidates:
-        # Geef de langste terug
-        return max(candidates, key=len)
-    return ""
+    return max(candidates, key=len) if candidates else ""
 
 
-def extract_with_claude(html: str) -> str:
+def extract_with_claude(html: str, notes: list[str]) -> str:
     """Laatste redmiddel: Claude extraheert hoofdtekst uit ruwe HTML."""
     client = get_anthropic_client()
     if not client:
@@ -229,8 +274,8 @@ def extract_with_claude(html: str) -> str:
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8096,
+            model=CLAUDE_MODEL,
+            max_tokens=16000,
             system=(
                 "Je krijgt ruwe HTML van een webpagina. Extraheer ALLEEN de "
                 "hoofdtekst van het artikel of nieuwsbericht. Negeer menu's, "
@@ -241,15 +286,18 @@ def extract_with_claude(html: str) -> str:
             ),
             messages=[{"role": "user", "content": cleaned}],
         )
-        result = response.content[0].text.strip()
-        if result == "GEEN_ARTIKEL" or len(result) < 100:
-            return ""
-        return result
     except Exception:
         return ""
 
+    result = _reply_text(response)
+    if result == "GEEN_ARTIKEL" or len(result) < 100:
+        return ""
+    if response.stop_reason == "max_tokens":
+        notes.append("Het artikel was te lang om volledig op te halen: het einde ontbreekt.")
+    return result
 
-def extract_text_url(url: str) -> str:
+
+def extract_text_url(url: str, notes: list[str]) -> str:
     if not is_valid_url(url):
         st.error("Ongeldige URL. Gebruik http:// of https://")
         return ""
@@ -274,13 +322,13 @@ def extract_text_url(url: str) -> str:
 
     # Strategie 2: JSON-LD (Schema.org Article)
     jsonld_text = extract_jsonld(html)
-    if jsonld_text and len(jsonld_text) > 100:
+    if len(jsonld_text) > 100:
         return jsonld_text
 
     # Strategie 3: Claude als laatste redmiddel
     st.info("⚙️ Standaard extractie lukte niet — Claude probeert het nu...")
-    claude_text = extract_with_claude(html)
-    if claude_text and len(claude_text) > 100:
+    claude_text = extract_with_claude(html, notes)
+    if claude_text:
         return claude_text
 
     st.error(
@@ -290,84 +338,116 @@ def extract_text_url(url: str) -> str:
     return ""
 
 
-# ── Vertaling & samenvatting ──────────────────────────────────────────────────
+# ── Tekst in stukken knippen ──────────────────────────────────────────────────
 
-def translate_to_dutch(text: str) -> str:
-    client = get_anthropic_client()
-    if not client:
-        st.error("Anthropic API-sleutel ontbreekt.")
+def _wrap_words(text: str, max_chars: int):
+    """Knip één te lange zin tussen woorden in delen van hooguit max_chars."""
+    while len(text) > max_chars:
+        cut = text.rfind(" ", 0, max_chars + 1)
+        if cut <= 0:
+            cut = max_chars
+        yield text[:cut]
+        text = text[cut:].lstrip()
+    if text:
+        yield text
+
+
+def split_text(text: str, max_chars: int) -> list[str]:
+    """Verdeel tekst in stukken van hooguit max_chars.
+
+    Knipt bij voorkeur tussen alinea's, anders tussen zinnen (leesteken gevolgd
+    door witruimte, zodat getallen als "4.7" heel blijven) en pas als één zin
+    te lang is tussen woorden.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    # (scheiding ervoor, tekst): alinea's houden hun regelovergang, zinnen uit
+    # dezelfde alinea een spatie.
+    pieces: list[tuple[str, str]] = []
+    sep = ""
+    for paragraph, newlines in re.findall(r"([^\n]+)(\n*)", text):
+        paragraph = paragraph.strip()
+        if len(paragraph) <= max_chars:
+            if paragraph:
+                pieces.append((sep, paragraph))
+        else:
+            inner_sep = sep
+            for sentence in re.split(r"(?<=[.!?…])\s+", paragraph):
+                for part in _wrap_words(sentence, max_chars):
+                    pieces.append((inner_sep, part))
+                    inner_sep = " "
+        sep = "\n\n" if len(newlines) > 1 or not paragraph else "\n"
+
+    chunks, current = [], ""
+    for sep, piece in pieces:
+        if current and len(current) + len(sep) + len(piece) > max_chars:
+            chunks.append(current)
+            current = piece
+        else:
+            current = current + sep + piece if current else piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# ── Vertaling & titel ─────────────────────────────────────────────────────────
+
+def detect_language(text: str) -> str:
+    """Taalcode van de tekst ('nl', 'en', ...), of '' als die niet te bepalen is."""
+    try:
+        return detect(text)
+    except LangDetectException:
         return ""
+
+
+def translate_chunk(client: anthropic.Anthropic, text: str) -> str:
+    """Vertaal één stuk tekst naar het Nederlands. Gooit een fout als dat niet lukt."""
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        system=(
+            "Je bent een professionele vertaler. Je krijgt een fragment uit een "
+            "langere tekst. Vertaal het naar correct en natuurlijk Nederlands. "
+            "Behoud de alinea-indeling. Geef alleen de vertaling terug, zonder "
+            "toelichting of extra tekst. Is het fragment al Nederlands, geef het "
+            "dan ongewijzigd terug."
+        ),
+        messages=[{"role": "user", "content": text}],
+    )
+    translated = _reply_text(response)
+    if response.stop_reason != "end_turn" or not translated:
+        raise RuntimeError(f"vertaling onvolledig ({response.stop_reason})")
+    return translated
+
+
+def _fallback_title(text: str) -> str:
+    return text.strip().split("\n")[0][:80] or "Onbenoemd artikel"
+
+
+def generate_title(client: anthropic.Anthropic | None, text: str) -> str:
+    """Korte Nederlandse titel via Claude (fallback: eerste regel van de tekst)."""
+    if not client:
+        return _fallback_title(text)
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8096,
-            system=(
-                "Je bent een professionele vertaler. Vertaal de aangeleverde tekst "
-                "naar correct en natuurlijk Nederlands. Behoud de originele opmaak "
-                "en alinea-indeling. Geef alleen de vertaalde tekst terug, zonder "
-                "toelichting of extra tekst."
-            ),
-            messages=[{"role": "user", "content": text}],
-        )
-        return response.content[0].text.strip()
-    except Exception as e:
-        st.error(f"Vertaling mislukt: {e}")
-        return ""
-
-
-def generate_title(text: str) -> str:
-    """Genereer korte beschrijvende titel via Claude (fallback: eerste regel)."""
-    client = get_anthropic_client()
-    snippet = text.strip()[:2000]
-    if not client:
-        return text.strip().split("\n")[0][:80] or "Onbenoemd artikel"
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=CLAUDE_MODEL,
             max_tokens=100,
             system=(
-                "Je krijgt een artikel of document. Geef één korte, beschrijvende "
-                "titel terug (max 70 tekens) die de inhoud samenvat. Geef alleen "
-                "de titel zelf, zonder aanhalingstekens of toelichting."
+                "Je krijgt het begin van een artikel of document. Geef één korte, "
+                "beschrijvende Nederlandse titel terug (max 70 tekens) die de "
+                "inhoud samenvat. Geef alleen de titel zelf, zonder "
+                "aanhalingstekens of toelichting."
             ),
-            messages=[{"role": "user", "content": snippet}],
+            messages=[{"role": "user", "content": text.strip()[:2000]}],
         )
-        return response.content[0].text.strip()[:80]
+        return _reply_text(response)[:80] or _fallback_title(text)
     except Exception:
-        return text.strip().split("\n")[0][:80] or "Onbenoemd artikel"
+        return _fallback_title(text)
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-
-def split_text(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
-    if len(text) <= max_chars:
-        return [text]
-    sentences, current = [], ""
-    for char in text:
-        current += char
-        if char in ".!?\n" and len(current) > 1:
-            sentences.append(current)
-            current = ""
-    if current:
-        sentences.append(current)
-
-    chunks, chunk = [], ""
-    for sentence in sentences:
-        if len(chunk) + len(sentence) <= max_chars:
-            chunk += sentence
-        else:
-            if chunk:
-                chunks.append(chunk.strip())
-            if len(sentence) > max_chars:
-                for i in range(0, len(sentence), max_chars):
-                    chunks.append(sentence[i:i + max_chars])
-                chunk = ""
-            else:
-                chunk = sentence
-    if chunk:
-        chunks.append(chunk.strip())
-    return [c for c in chunks if c]
-
 
 TTS_MAX_ATTEMPTS = 4  # extra bovenop de retries die de OpenAI-SDK zelf al doet
 
@@ -383,7 +463,7 @@ def _tts_chunk(client: OpenAI, voice: str, chunk: str) -> bytes:
     for attempt in range(TTS_MAX_ATTEMPTS):
         try:
             return client.audio.speech.create(
-                model="tts-1", voice=voice, input=chunk
+                model=TTS_MODEL, voice=voice, input=chunk
             ).content
         except (openai.APIStatusError, openai.APIConnectionError, openai.APITimeoutError) as e:
             last_error = e
@@ -398,115 +478,120 @@ def _tts_chunk(client: OpenAI, voice: str, chunk: str) -> bytes:
     raise last_error  # onbereikbaar, maar houdt type-checkers tevreden
 
 
-def text_to_audio(client: OpenAI, text: str, voice: str,
-                  progress_bar, base: float, span: float) -> bytes:
-    """Parallelle TTS. Update progress_bar tussen `base` en `base + span`."""
-    chunks = split_text(text)
+def _convert_chunk(chunk: str, voice: str, tts_client: OpenAI,
+                   translator: anthropic.Anthropic | None) -> tuple[bytes, int, str | None]:
+    """Vertaal (als er een `translator` is) en spreek één stuk tekst in.
 
-    if len(chunks) == 1:
+    Draait in een werkthread en doet daarom geen Streamlit-aanroepen. Geeft
+    (audio, aantal ingesproken tekens, vertaalfout) terug. Lukt de vertaling
+    niet, dan wordt het stuk onvertaald ingesproken en staat de reden in het
+    derde veld. Een TTS-fout wordt doorgegooid.
+    """
+    translate_error = None
+    if translator:
         try:
-            return _tts_chunk(client, voice, chunks[0])
+            chunk = translate_chunk(translator, chunk)
         except Exception as e:
-            st.error(f"TTS API-fout: {e}")
-            return b""
+            translate_error = str(e)
 
-    results: list[bytes | None] = [None] * len(chunks)
-    completed = 0
-    failed_chunks: list[int] = []
-
-    with ThreadPoolExecutor(max_workers=TTS_PARALLEL_WORKERS) as executor:
-        futures = {
-            executor.submit(_tts_chunk, client, voice, chunk): i
-            for i, chunk in enumerate(chunks)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                failed_chunks.append(idx)
-                st.warning(f"Chunk {idx + 1} bleef falen na meerdere pogingen: {e}")
-                continue
-            completed += 1
-            progress_bar.progress(
-                base + (completed / len(chunks)) * span,
-                text=f"🎤 Audio genereren... ({completed}/{len(chunks)} chunks)",
-            )
-
-    if failed_chunks:
-        st.error(
-            f"Audio kon niet volledig gegenereerd worden — "
-            f"{len(failed_chunks)} van {len(chunks)} delen mislukten na herhaalde pogingen. "
-            f"Probeer het opnieuw."
-        )
-        return b""
-
-    return b"".join(results)
+    audio = b"".join(
+        _tts_chunk(tts_client, voice, part)
+        for part in split_text(chunk, TTS_HARD_LIMIT)
+    )
+    return audio, len(chunk), translate_error
 
 
 # ── Hoofdpipeline ─────────────────────────────────────────────────────────────
 
 def process_to_audio(source_type: str, source: str, source_data,
                      voice: str, auto_translate: bool) -> dict | None:
-    """Doorloop de hele pipeline: extractie → vertaling → titel → TTS."""
-    progress = st.progress(0.0, text="🚀 Verwerken starten...")
+    """Tekst ophalen, daarna per stuk tegelijk vertalen en inspreken."""
+    progress = st.progress(0.0, text="📄 Tekst ophalen...")
+    notes: list[str] = []  # meldingen die na afloop bij het resultaat horen
 
     try:
-        # 1. Tekstextractie (0% → 20%)
-        progress.progress(0.05, text="📄 Tekst voorbereiden...")
         if source_type == "pdf":
             text = extract_text_pdf(source_data)
         elif source_type == "url":
-            text = extract_text_url(source)
-        else:  # source_type == "text"
-            text = source_data.strip() if source_data else ""
-
-        if not text:
-            if source_type == "text":
+            text = extract_text_url(source, notes)
+        else:
+            text = (source_data or "").strip()
+            if not text:
                 st.error("Geen tekst ingevoerd.")
+        if not text:
             return None
 
-        progress.progress(0.20, text=f"📄 Tekst gelezen ({len(text):,} tekens)".replace(",", "."))
-
-        # 2. Vertaling (20% → 35%)
-        if auto_translate:
-            try:
-                lang = detect(text)
-            except LangDetectException:
-                lang = "nl"
-            if lang != "nl":
-                progress.progress(0.25, text=f"🌍 Vertalen vanuit {lang.upper()} naar Nederlands...")
-                translated = translate_to_dutch(text)
-                if translated:
-                    text = translated
-                progress.progress(0.35, text="🌍 Vertaling klaar.")
-
-        # 3. Titel (35% → 40%)
-        progress.progress(0.37, text="📝 Titel genereren...")
-        title = generate_title(text)
-        progress.progress(0.40, text=f"📝 Titel: {title[:60]}")
-
-        # 4. TTS (40% → 100%)
-        client = get_openai_client()
-        if not client:
+        tts_client = get_openai_client()
+        if not tts_client:
             st.error("OpenAI API-sleutel ontbreekt.")
             return None
+        claude = get_anthropic_client()
 
-        audio_bytes = text_to_audio(
-            client, text, voice, progress, base=0.40, span=0.60,
-        )
-        if not audio_bytes:
-            return None
+        lang = detect_language(text)
+        translate = auto_translate and lang not in ("", "nl")
+        if translate and not claude:
+            notes.append("Niet vertaald: de Anthropic API-sleutel ontbreekt.")
+            translate = False
 
-        progress.progress(1.0, text="✅ Klaar!")
+        chunks = split_text(text, CHUNK_CHARS)
+        total  = len(chunks)
+        action = f"Vertalen ({lang.upper()} → NL) en inspreken" if translate else "Inspreken"
+        progress.progress(0.10, text=f"🎤 {action}... (0/{total} delen klaar)")
+
+        audio_parts: list[bytes] = [b""] * total
+        spoken_chars = 0
+        translate_errors: list[str] = []
+
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        try:
+            # De titel komt uit het begin van de brontekst en hoeft dus niet
+            # op de vertaling te wachten.
+            title_future = executor.submit(generate_title, claude, text)
+            futures = {
+                executor.submit(
+                    _convert_chunk, chunk, voice, tts_client, claude if translate else None
+                ): i
+                for i, chunk in enumerate(chunks)
+            }
+            for done, future in enumerate(as_completed(futures), start=1):
+                idx = futures[future]
+                try:
+                    audio, chars, translate_error = future.result()
+                except Exception as e:
+                    st.error(
+                        f"Audio genereren mislukt bij deel {idx + 1} van {total}, "
+                        f"ook na herhaalde pogingen: {e}"
+                    )
+                    return None
+                audio_parts[idx] = audio
+                spoken_chars += chars
+                if translate_error:
+                    translate_errors.append(translate_error)
+                progress.progress(
+                    0.10 + 0.90 * done / total,
+                    text=f"🎤 {action}... ({done}/{total} delen klaar)",
+                )
+            title = title_future.result()
+        finally:
+            # Na een fout: stukken die nog in de wachtrij staan niet meer
+            # uitvoeren (en dus niet betalen).
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        if translate_errors:
+            notes.append(
+                f"{len(translate_errors)} van de {total} delen konden niet vertaald "
+                f"worden en zijn in de oorspronkelijke taal voorgelezen "
+                f"({translate_errors[0]})."
+            )
 
         return {
             "title":       title,
             "source":      source,
             "source_type": source_type,
             "voice":       voice,
-            "chars":       len(text),
-            "audio_bytes": audio_bytes,
+            "chars":       spoken_chars,
+            "audio_bytes": b"".join(audio_parts),
+            "notes":       notes,
         }
     finally:
         progress.empty()
@@ -554,8 +639,10 @@ def render_sidebar():
                 src_display = src if len(src) <= 50 else src[:47] + "..."
                 st.caption(f"📍 {src_display}")
 
-            audio_bytes = load_audio(entry["id"])
-            if not audio_bytes:
+            # Alleen kijken of het bestand er is: de MP3 zelf wordt pas
+            # ingelezen als het artikel wordt afgespeeld.
+            has_audio = audio_path(entry["id"]) is not None
+            if not has_audio:
                 st.warning("MP3-bestand niet gevonden.")
 
             cols = st.columns([3, 1])
@@ -563,7 +650,7 @@ def render_sidebar():
                 if st.button(
                     "Voorlezen",
                     key=f"play_saved_{entry['id']}",
-                    disabled=not audio_bytes,
+                    disabled=not has_audio,
                     use_container_width=True,
                 ):
                     st.session_state["active_library_entry_id"] = entry["id"]
@@ -628,9 +715,27 @@ def render_saved_player():
 
 # ── Hoofdscherm ───────────────────────────────────────────────────────────────
 
+def input_signature(source_type: str, source: str, source_data,
+                    voice: str, auto_translate: bool) -> str:
+    """Kenmerk van invoer + instellingen. Verandert er iets, dan hoort een
+    eerder resultaat er niet meer bij en is een nieuwe conversie nodig."""
+    if source_type == "pdf":
+        content = f"{source_data.size}:{getattr(source_data, 'file_id', '')}"
+    elif source_type == "text":
+        content = hashlib.md5(source_data.strip().encode("utf-8")).hexdigest()
+    else:
+        content = ""
+    return f"{source_type}:{source}:{content}:{voice}:{auto_translate}"
+
+
 def render_main():
     st.title("🎧 Voorlezen")
-    st.caption("Upload een PDF of voer een URL in en laat het direct voorlezen.")
+    st.caption("Upload een PDF, voer een URL in of plak tekst, en laat het direct voorlezen.")
+
+    # Melding van vóór de laatste st.rerun() (die wist alles wat op het scherm stond)
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.success(flash)
 
     render_saved_player()
 
@@ -696,7 +801,10 @@ def render_main():
             st.info(f"✍️ Klaar om te verwerken: **{chars:,} tekens ingevoerd**".replace(",", "."))
 
     ready = source_type is not None
-    current_input_signature = f"{source_type}:{source}" if ready else None
+    current_input_signature = (
+        input_signature(source_type, source, source_data, voice, auto_translate)
+        if ready else None
+    )
     pending = st.session_state.get("pending_result")
 
     if pending and pending.get("input_signature") != current_input_signature:
@@ -737,6 +845,8 @@ def render_main():
         f"🎤 {pending['voice']} · "
         f"{pending['chars']:,} tekens".replace(",", ".")
     )
+    for note in pending.get("notes", []):
+        st.warning(note)
 
     if st.session_state.get("show_pending_audio"):
         st.audio(pending["audio_bytes"], format="audio/mpeg")
@@ -762,7 +872,8 @@ def render_main():
                     audio_bytes = pending["audio_bytes"],
                 )
                 st.session_state.pop("pending_result", None)
-                st.success(f"Opgeslagen: '{title_input.strip()}'")
+                st.session_state.pop("show_pending_audio", None)
+                st.session_state["flash"] = f"Opgeslagen in de bibliotheek: '{title_input.strip()}'"
                 st.rerun()
 
     with cols[1]:
